@@ -6,12 +6,15 @@ __pycache__/
 .Python
 build/
 dist/
+pip-wheel-metadata/
 
 .env
 .env.*
+.envrc
 .venv/
 venv/
 env/
+.python-version
 
 .vscode/
 .idea/
@@ -24,6 +27,7 @@ env/
 coverage.xml
 htmlcov/
 
+.cache/
 cache/
 logs/
 lightning_logs/
@@ -37,5 +41,27 @@ frontend/dist/
 *.data
 *.pkl
 *.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+*.db
+*.sqlite
+*.sqlite3
+
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.flac
+*.gif
 
 tmp/
+*.tmp
