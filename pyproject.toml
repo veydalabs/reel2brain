@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reel2brain"
+version = "0.1.0"
+description = "Production Reel2Brain web app built on Meta's TRIBE v2 model"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "Veyda Labs"}]
+
+dependencies = [
+  "neuralset==0.0.2",
+  "neuraltrain==0.0.2",
+  "torch>=2.5.1,<2.8",
+  "numpy==2.2.6",
+  "torchvision>=0.20,<0.23",
+  "x_transformers==1.27.20",
+  "einops",
+  "pyyaml",
+  "moviepy>=2.2.1",
+  "huggingface_hub",
+  "gtts",
+  "langdetect",
+  "spacy",
+  "soundfile",
+  "pip",
+  "Levenshtein",
+  "julius",
+  "transformers"
+]
+
+[project.scripts]
+reel2brain = "tribev2.cli:launch_reel2brain"
+
+[project.optional-dependencies]
+  plotting = [
+    "nibabel",
+    "matplotlib",
+    "seaborn",
+    "colorcet",
+    "nilearn",
+    "scipy",
+    "pyvista",
+    "scikit-image",
+  ]
+  training = [
+    "nibabel",
+    "torchmetrics",
+    "wandb",
+    "lightning",  
+  ]
+  test = [
+    "pytest",
+  ]
+  webapp = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "python-multipart>=0.0.10",
+    "openai>=1.0",
+  ]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.setuptools.packages.find]
+include = ["tribe*"]
+
+[tool.setuptools.package-data]
+tribev2 = ["web_dist/**/*"]

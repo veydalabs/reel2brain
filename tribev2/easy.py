@@ -1,0 +1,2899 @@
+from __future__ import annotations
+
+from collections import OrderedDict, defaultdict
+from contextlib import redirect_stderr
+from dataclasses import dataclass, field
+from functools import lru_cache
+import io
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import typing as tp
+import unicodedata
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+import torch
+
+from tribev2.demo_utils import (
+    TextToEvents,
+    TribeModel,
+    _cuda_runtime_supported,
+    build_text_events_from_text,
+    get_audio_and_text_events,
+)
+from tribev2.plotting.cortical import PlotBrainNilearn
+from tribev2.plotting.cortical_pv import PlotBrainPyvista
+from tribev2.plotting.utils import (
+    get_clip,
+    get_cmap,
+    get_scalar_mappable,
+    get_text,
+    has_audio,
+    has_video,
+    robust_normalize,
+)
+from tribev2.utils import get_hcp_labels, summarize_by_roi
+
+logger = logging.getLogger(__name__)
+
+PRIMARY_TEXT_MODEL = "meta-llama/Llama-3.2-3B"
+FALLBACK_TEXT_MODEL = "unsloth/Llama-3.2-3B"
+DEFAULT_TEXT_MODEL = PRIMARY_TEXT_MODEL
+VALID_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+@dataclass
+class PredictionRun:
+    events: pd.DataFrame
+    preds: np.ndarray
+    segments: list
+    input_kind: str
+    source_path: Path | None = None
+    raw_text: str | None = None
+
+
+@dataclass
+class ImageComparisonRun:
+    runs: list[PredictionRun]
+    compare_kind: str = "image"
+
+    @property
+    def input_kind(self) -> str:
+        return self.compare_kind
+
+
+@dataclass
+class MultiModalRun(PredictionRun):
+    component_runs: dict[str, PredictionRun] = field(default_factory=dict)
+    source_paths: dict[str, Path] = field(default_factory=dict)
+    primary_input_kind: str | None = None
+
+
+MULTIMODAL_CHANNEL_ORDER: tuple[str, ...] = ("visual", "audio", "text")
+MULTIMODAL_CHANNEL_LABELS: dict[str, str] = {
+    "visual": "Visual",
+    "audio": "Audio",
+    "text": "Text",
+}
+MULTIMODAL_SOURCE_LABELS: dict[str, str] = {
+    "video": "Video",
+    "image": "Image",
+    "audio": "Audio",
+    "text": "Text",
+}
+
+
+EXPLAINABILITY_SOURCES: tuple[tuple[str, str], ...] = (
+    (
+        "Meta AI blog (2026-03-26)",
+        "https://ai.meta.com/blog/tribe-v2-brain-predictive-foundation-model/",
+    ),
+    (
+        "Meta AI publication (2026-03-26)",
+        "https://ai.meta.com/research/publications/a-foundation-model-of-vision-audition-and-language-for-in-silico-neuroscience/",
+    ),
+    (
+        "Official demo notebook",
+        "https://github.com/facebookresearch/tribev2/blob/main/tribe_demo.ipynb",
+    ),
+)
+
+VALENCE_CUE_LEXICON: dict[str, set[str]] = {
+    "positive": {
+        "good", "great", "joy", "happy", "love", "safe", "calm", "hope", "beautiful",
+        "success", "excited", "wonderful", "bien", "heureux", "heureuse", "joie",
+        "amour", "calme", "espoir", "belle", "beau", "positif", "positive",
+    },
+    "negative": {
+        "bad", "sad", "hate", "pain", "danger", "death", "violent", "loss", "cry",
+        "terrible", "awful", "mal", "triste", "haine", "douleur", "danger", "mort",
+        "violent", "perte", "pleure", "negatif", "negative",
+    },
+    "joy": {
+        "joy", "happy", "delight", "smile", "laugh", "celebrate", "relief", "fun",
+        "joie", "heureux", "heureuse", "sourire", "rire", "celebre", "soulagement",
+    },
+    "fear": {
+        "fear", "afraid", "scared", "terror", "panic", "threat", "danger", "worry",
+        "worried", "anxiety", "anxious", "peur", "effraye", "terrifie", "panique",
+        "menace", "inquiet", "inquiete", "anxiete",
+    },
+    "desire": {
+        "want", "need", "wish", "hope", "desire", "crave", "longing", "dream",
+        "envie", "veux", "veut", "vouloir", "besoin", "souhaite", "desir", "reve",
+    },
+    "anger": {
+        "anger", "angry", "rage", "furious", "hate", "fight", "attack", "mad",
+        "colere", "furieux", "rage", "haine", "attaque", "frappe",
+    },
+    "sadness": {
+        "sad", "grief", "cry", "tears", "lonely", "loss", "mourning",
+        "triste", "chagrin", "pleure", "larmes", "seul", "perte", "deuil",
+    },
+    "calm": {
+        "calm", "quiet", "peace", "soft", "slow", "rest", "gentle",
+        "calme", "paisible", "doux", "douce", "lent", "lente", "repos",
+    },
+}
+
+
+EMOTION_AXES: tuple[str, ...] = ("joy", "fear", "sadness", "anger", "desire", "calm")
+EMOTION_LABELS: dict[str, str] = {
+    "joy": "Joy",
+    "fear": "Fear",
+    "sadness": "Sadness",
+    "anger": "Anger",
+    "desire": "Desire",
+    "calm": "Calm",
+}
+ZONE_FAMILY_META: OrderedDict[str, dict[str, tp.Any]] = OrderedDict(
+    [
+        (
+            "visual_occipital",
+            {
+                "label": "Occipital visual",
+                "systems": ["early vision", "visual scene processing", "shape and contrast"],
+                "keywords": (
+                    "V1",
+                    "V2",
+                    "V3",
+                    "V4",
+                    "V6",
+                    "V7",
+                    "V8",
+                    "LO",
+                    "MT",
+                    "MST",
+                    "FST",
+                    "VVC",
+                    "VMV",
+                    "FFC",
+                    "PIT",
+                    "PHA",
+                    "PHT",
+                    "PH",
+                    "POS",
+                    "PCV",
+                    "V3A",
+                    "V3B",
+                    "V3CD",
+                    "V4t",
+                    "V6A",
+                ),
+            },
+        ),
+        (
+            "auditory_temporal",
+            {
+                "label": "Auditory / temporal",
+                "systems": ["audition", "speech", "prosodic cues", "auditory semantics"],
+                "keywords": (
+                    "A1",
+                    "A4",
+                    "A5",
+                    "LBelt",
+                    "MBelt",
+                    "PBelt",
+                    "RI",
+                    "H",
+                    "STG",
+                    "STS",
+                    "STV",
+                    "TA2",
+                    "TE1",
+                    "TE2",
+                    "TG",
+                    "TPOJ",
+                    "Pir",
+                    "52",
+                ),
+            },
+        ),
+        (
+            "tpj_social",
+            {
+                "label": "TPJ / social association",
+                "systems": ["social cognition", "narrative context", "plausible mentalizing"],
+                "keywords": (
+                    "TPOJ",
+                    "PGi",
+                    "PGp",
+                    "PGs",
+                    "PSL",
+                    "PF",
+                    "PFcm",
+                    "PFm",
+                    "PFop",
+                    "PFt",
+                    "STS",
+                    "TE1m",
+                    "TE1p",
+                    "TGd",
+                    "TGv",
+                    "ProS",
+                    "PreS",
+                    "RSC",
+                ),
+            },
+        ),
+        (
+            "dorsal_attention_parietal",
+            {
+                "label": "Dorsal parietal / attention",
+                "systems": ["visuospatial attention", "salience", "orienting"],
+                "keywords": (
+                    "IPS",
+                    "IP0",
+                    "IP1",
+                    "IP2",
+                    "LIP",
+                    "MIP",
+                    "VIP",
+                    "AIP",
+                    "7A",
+                    "7P",
+                    "7m",
+                    "PEF",
+                    "PCV",
+                    "V6A",
+                    "V7",
+                ),
+            },
+        ),
+        (
+            "frontoparietal_control",
+            {
+                "label": "Frontal / control",
+                "systems": ["attentional control", "selection", "context maintenance"],
+                "keywords": (
+                    "FEF",
+                    "IFJ",
+                    "IFS",
+                    "i6-8",
+                    "s6-8",
+                    "55b",
+                    "6",
+                    "8",
+                    "9",
+                    "46",
+                    "SFL",
+                    "SCEF",
+                    "p9-46v",
+                    "a9-46v",
+                    "9-46d",
+                ),
+            },
+        ),
+        (
+            "medial_value_cingulate",
+            {
+                "label": "Medial / cingulate / value",
+                "systems": ["evaluation", "monitoring", "plausible affective context"],
+                "keywords": (
+                    "10",
+                    "11",
+                    "13",
+                    "OFC",
+                    "pOFC",
+                    "a24",
+                    "p24",
+                    "24",
+                    "a32",
+                    "p32",
+                    "d32",
+                    "s32",
+                    "25",
+                    "33pr",
+                    "23",
+                    "31",
+                    "v23ab",
+                    "d23ab",
+                ),
+            },
+        ),
+        (
+            "sensorimotor_opercular",
+            {
+                "label": "Sensorimotor / opercular",
+                "systems": ["somatomotor", "plausible cortical interoception", "opercular response"],
+                "keywords": (
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5L",
+                    "5m",
+                    "5mv",
+                    "MI",
+                    "OP",
+                    "FOP",
+                    "AVI",
+                    "AAIC",
+                    "PI",
+                    "PoI",
+                    "Ig",
+                    "43",
+                ),
+            },
+        ),
+        (
+            "association_other",
+            {
+                "label": "Diffuse association",
+                "systems": ["heterogeneous association", "distributed integration"],
+                "keywords": (),
+            },
+        ),
+    ]
+)
+ZONE_EMOTION_WEIGHTS: dict[str, dict[str, float]] = {
+    "visual_occipital": {"joy": 0.18, "fear": 0.22, "sadness": 0.10, "anger": 0.10, "desire": 0.24, "calm": 0.12},
+    "auditory_temporal": {"joy": 0.18, "fear": 0.24, "sadness": 0.22, "anger": 0.22, "desire": 0.10, "calm": 0.18},
+    "tpj_social": {"joy": 0.20, "fear": 0.22, "sadness": 0.28, "anger": 0.14, "desire": 0.18, "calm": 0.10},
+    "dorsal_attention_parietal": {"joy": 0.08, "fear": 0.34, "sadness": 0.12, "anger": 0.22, "desire": 0.16, "calm": 0.05},
+    "frontoparietal_control": {"joy": 0.08, "fear": 0.18, "sadness": 0.18, "anger": 0.22, "desire": 0.12, "calm": 0.18},
+    "medial_value_cingulate": {"joy": 0.22, "fear": 0.18, "sadness": 0.30, "anger": 0.16, "desire": 0.28, "calm": 0.20},
+    "sensorimotor_opercular": {"joy": 0.08, "fear": 0.34, "sadness": 0.20, "anger": 0.30, "desire": 0.10, "calm": 0.06},
+    "association_other": {"joy": 0.14, "fear": 0.16, "sadness": 0.16, "anger": 0.14, "desire": 0.16, "calm": 0.14},
+}
+EMOTION_MODALITY_PRIORS: dict[str, dict[str, float]] = {
+    "video": {"joy": 0.12, "fear": 0.16, "sadness": 0.10, "anger": 0.12, "desire": 0.14, "calm": 0.08},
+    "image": {"joy": 0.10, "fear": 0.14, "sadness": 0.08, "anger": 0.10, "desire": 0.16, "calm": 0.06},
+    "audio": {"joy": 0.12, "fear": 0.16, "sadness": 0.14, "anger": 0.16, "desire": 0.08, "calm": 0.14},
+    "text": {"joy": 0.10, "fear": 0.10, "sadness": 0.10, "anger": 0.10, "desire": 0.10, "calm": 0.10},
+    "multimodal": {"joy": 0.12, "fear": 0.14, "sadness": 0.12, "anger": 0.12, "desire": 0.12, "calm": 0.10},
+}
+
+
+@lru_cache(maxsize=4)
+def get_pyvista_plotter(mesh: str = "fsaverage5") -> PlotBrainPyvista:
+    """Cache the heavier PyVista plotter/mesh backend for app reuse."""
+    return PlotBrainPyvista(mesh=mesh)
+
+
+def resolve_device(device: str = "auto") -> str:
+    """Resolve the requested runtime device for TRIBE."""
+    if device == "auto":
+        return "cuda" if _cuda_runtime_supported() else "cpu"
+    if device == "cuda" and not _cuda_runtime_supported():
+        raise RuntimeError(
+            "CUDA was requested but the installed PyTorch runtime cannot execute "
+            "this GPU. Install a Blackwell-compatible build, for example "
+            "`torch>=2.7` with `cu128`."
+        )
+    if device not in {"cpu", "cuda"}:
+        raise ValueError(f"Unsupported device: {device}")
+    return device
+
+
+def resolve_text_model_name(text_model_name: str | None = None) -> str:
+    """Resolve the text backbone used by the TRIBE text extractor."""
+    candidate = text_model_name or os.environ.get("TRIBEV2_TEXT_MODEL")
+    if candidate is None:
+        candidate = DEFAULT_TEXT_MODEL
+    candidate = str(candidate).strip()
+    if not candidate:
+        raise ValueError("Text model name must not be empty.")
+    return candidate
+
+
+@lru_cache(maxsize=8)
+def _text_model_config_available(model_name: str) -> bool:
+    """Return whether the extractor config can be resolved in this environment."""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(model_name, "config.json")
+        return True
+    except Exception as exc:
+        if _is_text_model_access_error(exc):
+            return False
+        raise
+
+
+def resolve_text_model_candidates(text_model_name: str | None = None) -> list[str]:
+    """Resolve a preferred->fallback chain for the TRIBE text extractor."""
+    candidate = resolve_text_model_name(text_model_name)
+    if candidate == PRIMARY_TEXT_MODEL:
+        if not _text_model_config_available(PRIMARY_TEXT_MODEL):
+            logger.warning(
+                "Preferred text backbone '%s' is unavailable in this environment; "
+                "using fallback '%s'.",
+                PRIMARY_TEXT_MODEL,
+                FALLBACK_TEXT_MODEL,
+            )
+            return [FALLBACK_TEXT_MODEL]
+        return [PRIMARY_TEXT_MODEL, FALLBACK_TEXT_MODEL]
+    return [candidate]
+
+
+def _is_text_model_access_error(exc: Exception) -> bool:
+    """Return True when the preferred text repo is unavailable in this env."""
+    message = f"{type(exc).__name__}: {exc}".lower()
+    patterns = (
+        "gated repo",
+        "cannot access gated repo",
+        "trying to access a gated repo",
+        "awaiting a review",
+        "403 client error",
+        "401 client error",
+        "repository not found",
+        "access to model",
+    )
+    return any(pattern in message for pattern in patterns)
+
+
+def load_model(
+    *,
+    checkpoint: str = "facebook/tribev2",
+    cache_folder: str | Path = "./cache",
+    device: str = "auto",
+    num_workers: int = 0,
+    text_model_name: str | None = None,
+    config_update: dict | None = None,
+) -> TribeModel:
+    """Load TRIBE with settings that are safe for local app usage."""
+    cache_folder = Path(cache_folder)
+    cache_folder.mkdir(parents=True, exist_ok=True)
+    merged_update = {"data.num_workers": int(num_workers)}
+    if config_update:
+        merged_update.update(config_update)
+    requested_text_model = (
+        text_model_name
+        if text_model_name is not None
+        else tp.cast(str | None, merged_update.get("data.text_feature.model_name"))
+    )
+    candidates = resolve_text_model_candidates(requested_text_model)
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        current_update = dict(merged_update)
+        current_update["data.text_feature.model_name"] = candidate
+        try:
+            model = TribeModel.from_pretrained(
+                checkpoint,
+                cache_folder=cache_folder,
+                device=resolve_device(device),
+                config_update=current_update,
+            )
+            setattr(model, "_tribev2_text_model_name", candidate)
+            if index > 0:
+                logger.warning(
+                    "Loaded TRIBE text backbone fallback '%s' after preferred model was unavailable.",
+                    candidate,
+                )
+            return model
+        except Exception as exc:
+            last_error = exc
+            is_last = index == len(candidates) - 1
+            if is_last or not _is_text_model_access_error(exc):
+                raise
+            logger.warning(
+                "Preferred text backbone '%s' unavailable, retrying with fallback '%s'.",
+                candidate,
+                candidates[index + 1],
+            )
+    assert last_error is not None
+    raise last_error
+
+
+def _prepare_media_events_with_quiet_stderr(
+    events: pd.DataFrame,
+    *,
+    audio_only: bool,
+) -> pd.DataFrame:
+    """Shield local app runs from tqdm/stderr issues inside event transforms."""
+    stderr_buffer = io.StringIO()
+    try:
+        with redirect_stderr(stderr_buffer):
+            return get_audio_and_text_events(events, audio_only=audio_only)
+    finally:
+        stderr_buffer.close()
+
+
+def prepare_events(
+    *,
+    cache_folder: str | Path,
+    text: str | None = None,
+    text_path: str | Path | None = None,
+    audio_path: str | Path | None = None,
+    video_path: str | Path | None = None,
+    image_path: str | Path | None = None,
+    transcribe: bool = False,
+    direct_text: bool = True,
+    seconds_per_word: float = 0.45,
+    max_context_words: int = 128,
+    image_duration: float = 4.0,
+    image_fps: int = 6,
+) -> tuple[pd.DataFrame, str]:
+    """Prepare a standardised events dataframe from one user input."""
+    provided = {
+        "text": text,
+        "text_path": text_path,
+        "audio_path": audio_path,
+        "video_path": video_path,
+        "image_path": image_path,
+    }
+    active = [name for name, value in provided.items() if value]
+    if len(active) != 1:
+        raise ValueError(
+            "Exactly one of text, text_path, audio_path, video_path or image_path must be provided."
+        )
+
+    cache_folder = Path(cache_folder)
+    cache_folder.mkdir(parents=True, exist_ok=True)
+
+    if text is not None or text_path is not None:
+        raw_text = text if text is not None else Path(text_path).read_text(encoding="utf-8")
+        if direct_text:
+            return (
+                build_text_events_from_text(
+                    raw_text,
+                    seconds_per_word=seconds_per_word,
+                    max_context_words=max_context_words,
+                ),
+                "text",
+            )
+        return (
+            TextToEvents(
+                text=raw_text,
+                infra={"folder": str(cache_folder), "mode": "retry"},
+            ).get_events(),
+            "text",
+        )
+
+    if image_path is not None:
+        image_path = Path(image_path)
+        if image_path.suffix.lower() not in VALID_IMAGE_SUFFIXES:
+            raise ValueError(
+                f"Unsupported image format '{image_path.suffix}'. "
+                f"Expected one of {sorted(VALID_IMAGE_SUFFIXES)}."
+            )
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Image file does not exist: {image_path}")
+        video_path = build_video_from_image(
+            image_path=image_path,
+            output_folder=cache_folder / "image_clips",
+            duration=image_duration,
+            fps=image_fps,
+        )
+        events = pd.DataFrame(
+            [
+                {
+                    "type": "Video",
+                    "filepath": str(video_path),
+                    "start": 0,
+                    "timeline": "default",
+                    "subject": "default",
+                }
+            ]
+        )
+        return _prepare_media_events_with_quiet_stderr(events, audio_only=True), "image"
+
+    event_type = "Audio" if audio_path is not None else "Video"
+    path = Path(audio_path or video_path)  # type: ignore[arg-type]
+    events = pd.DataFrame(
+        [
+            {
+                "type": event_type,
+                "filepath": str(path),
+                "start": 0,
+                "timeline": "default",
+                "subject": "default",
+            }
+        ]
+    )
+    return (
+        _prepare_media_events_with_quiet_stderr(events, audio_only=not transcribe),
+        event_type.lower(),
+    )
+
+
+def predict_from_prepared_events(
+    model: TribeModel,
+    events: pd.DataFrame,
+    *,
+    input_kind: str,
+    source_path: Path | None = None,
+    raw_text: str | None = None,
+    verbose: bool = True,
+) -> PredictionRun:
+    stderr_buffer = io.StringIO()
+    try:
+        with redirect_stderr(stderr_buffer):
+            preds, segments = model.predict(events=events, verbose=verbose)
+    finally:
+        stderr_buffer.close()
+    return PredictionRun(
+        events=events,
+        preds=preds,
+        segments=segments,
+        input_kind=input_kind,
+        source_path=source_path,
+        raw_text=raw_text,
+    )
+
+
+def build_multimodal_events(
+    *,
+    cache_folder: str | Path,
+    text: str | None = None,
+    text_path: str | Path | None = None,
+    audio_path: str | Path | None = None,
+    video_path: str | Path | None = None,
+    image_path: str | Path | None = None,
+    transcribe: bool = False,
+    direct_text: bool = True,
+    seconds_per_word: float = 0.45,
+    max_context_words: int = 128,
+    image_duration: float = 4.0,
+    image_fps: int = 6,
+) -> tuple[pd.DataFrame, dict[str, dict[str, tp.Any]]]:
+    """Prepare one combined events frame plus per-modality metadata."""
+    component_specs: list[tuple[str, dict[str, tp.Any]]] = []
+    if video_path is not None:
+        component_specs.append(("video", {"video_path": video_path}))
+    if image_path is not None:
+        component_specs.append(("image", {"image_path": image_path}))
+    if audio_path is not None:
+        component_specs.append(("audio", {"audio_path": audio_path}))
+    if text is not None or text_path is not None:
+        component_specs.append(("text", {"text": text, "text_path": text_path}))
+    if len(component_specs) < 2:
+        raise ValueError("At least two modalities are required to build a multimodal run.")
+
+    prepared_components: dict[str, dict[str, tp.Any]] = {}
+    frames: list[pd.DataFrame] = []
+    cache_folder = Path(cache_folder)
+    for modality, payload in component_specs:
+        events, input_kind = prepare_events(
+            cache_folder=cache_folder,
+            transcribe=transcribe,
+            direct_text=direct_text,
+            seconds_per_word=seconds_per_word,
+            max_context_words=max_context_words,
+            image_duration=image_duration,
+            image_fps=image_fps,
+            **payload,
+        )
+        raw_text_value = None
+        if modality == "text":
+            raw_text_value = text if text is not None else Path(tp.cast(str | Path, text_path)).read_text(encoding="utf-8")
+        source_path = payload.get("video_path") or payload.get("audio_path") or payload.get("image_path")
+        prepared_components[modality] = {
+            "events": events.copy(),
+            "input_kind": input_kind,
+            "source_path": Path(source_path) if source_path else None,
+            "raw_text": raw_text_value,
+        }
+        frames.append(events)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    sort_columns = [column for column in ("start", "timeline", "type") if column in combined.columns]
+    if sort_columns:
+        combined = combined.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    return combined, prepared_components
+
+
+def predict_multimodal_from_prepared_events(
+    model: TribeModel,
+    combined_events: pd.DataFrame,
+    *,
+    prepared_components: dict[str, dict[str, tp.Any]],
+    verbose: bool = True,
+) -> MultiModalRun:
+    """Run one fused prediction and one prediction per modality."""
+    component_runs: dict[str, PredictionRun] = {}
+    for modality, spec in prepared_components.items():
+        component_runs[modality] = predict_from_prepared_events(
+            model,
+            tp.cast(pd.DataFrame, spec["events"]),
+            input_kind=str(spec["input_kind"]),
+            source_path=tp.cast(Path | None, spec["source_path"]),
+            raw_text=tp.cast(str | None, spec["raw_text"]),
+            verbose=False,
+        )
+
+    combined_source_path = None
+    primary_input_kind = None
+    for candidate in ("video", "image", "audio", "text"):
+        if candidate in prepared_components:
+            primary_input_kind = candidate
+            combined_source_path = tp.cast(Path | None, prepared_components[candidate]["source_path"])
+            break
+
+    fused = predict_from_prepared_events(
+        model,
+        combined_events,
+        input_kind="multimodal",
+        source_path=combined_source_path,
+        raw_text=tp.cast(str | None, prepared_components.get("text", {}).get("raw_text")),
+        verbose=verbose,
+    )
+    return MultiModalRun(
+        events=fused.events,
+        preds=fused.preds,
+        segments=fused.segments,
+        input_kind=fused.input_kind,
+        source_path=fused.source_path,
+        raw_text=fused.raw_text,
+        component_runs=component_runs,
+        source_paths={
+            modality: spec["source_path"]
+            for modality, spec in prepared_components.items()
+            if spec.get("source_path") is not None
+        },
+        primary_input_kind=primary_input_kind,
+    )
+
+
+def summarize_predictions(preds: np.ndarray) -> pd.DataFrame:
+    """Build a lightweight summary dataframe for charts."""
+    return pd.DataFrame(
+        {
+            "timestep": np.arange(len(preds)),
+            "mean": preds.mean(axis=1),
+            "std": preds.std(axis=1),
+            "mean_abs": np.abs(preds).mean(axis=1),
+            "max_abs": np.abs(preds).max(axis=1),
+        }
+    )
+
+
+def list_run_channels(run: PredictionRun) -> list[str]:
+    """Describe which signal channels are represented in the prepared events."""
+    if isinstance(run, MultiModalRun):
+        ordered: list[str] = []
+        for modality in ("video", "image", "audio", "text"):
+            if modality in run.component_runs:
+                ordered.append(MULTIMODAL_SOURCE_LABELS[modality].lower())
+        if ordered:
+            return ordered
+    channels: list[str] = []
+    event_types = {str(value).strip().lower() for value in run.events.get("type", pd.Series(dtype=object)).dropna()}
+    if run.input_kind == "image":
+        return ["static image", "synthetic video clip"]
+    if run.input_kind == "text":
+        return ["aligned text"]
+    if "video" in event_types or run.input_kind == "video":
+        channels.append("video")
+    if "audio" in event_types or run.input_kind == "audio":
+        channels.append("audio")
+    if {"word", "text"} & event_types or run.raw_text:
+        channels.append("aligned text")
+    if not channels:
+        channels.append(run.input_kind)
+    return channels
+
+
+def normalize_signal_for_display(
+    signal: np.ndarray,
+    *,
+    percentile: int | None = 99,
+    reference_signal: np.ndarray | None = None,
+) -> np.ndarray:
+    """Normalize a signal robustly and silence divide-by-zero edge cases."""
+    signal = np.asarray(signal, dtype=float)
+    if percentile is None:
+        return signal
+    if reference_signal is not None:
+        reference = np.asarray(reference_signal, dtype=float)
+        if reference.size == 0:
+            return np.zeros_like(signal, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            hi = np.percentile(reference, percentile)
+            lo = np.percentile(reference, 100 - percentile)
+            out = np.zeros_like(signal, dtype=float)
+            if np.isfinite(hi) and np.isfinite(lo) and abs(float(hi) - float(lo)) > 1e-12:
+                out = np.clip((signal - lo) / (hi - lo), 0.0, 1.0)
+        return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = robust_normalize(signal, percentile=percentile)
+    return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def build_display_reference_signal(
+    *items: PredictionRun | np.ndarray | None,
+) -> np.ndarray | None:
+    """Flatten one or more prediction tensors into a shared display reference."""
+    flattened: list[np.ndarray] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, PredictionRun):
+            signal = np.asarray(item.preds, dtype=float)
+        else:
+            signal = np.asarray(item, dtype=float)
+        if signal.size == 0:
+            continue
+        flattened.append(signal.reshape(-1))
+    if not flattened:
+        return None
+    return np.concatenate(flattened, axis=0)
+
+
+def build_comparison_display_reference(run: ImageComparisonRun) -> np.ndarray | None:
+    """Build one shared display scale for a side-by-side comparison run."""
+    return build_display_reference_signal(*(item.preds for item in run.runs))
+
+
+def select_animation_indices(n_timesteps: int, max_frames: int = 72) -> list[int]:
+    """Select evenly spaced timestep indices while preserving endpoints."""
+    if n_timesteps <= 0:
+        return []
+    if n_timesteps <= max_frames:
+        return list(range(n_timesteps))
+    values = np.linspace(0, n_timesteps - 1, num=max_frames)
+    indices = sorted({int(round(value)) for value in values})
+    if indices[0] != 0:
+        indices[0] = 0
+    if indices[-1] != n_timesteps - 1:
+        indices[-1] = n_timesteps - 1
+    return indices
+
+
+def normalize_text_for_cues(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    normalized = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    return re.findall(r"[a-z']+", normalized)
+
+
+def infer_affective_cues(text: str | None) -> dict[str, tp.Any]:
+    """Estimate coarse valence/emotion cues from stimulus text, not from the map alone."""
+    if not text or not text.strip():
+        return {
+            "available": False,
+            "valence": "undetermined",
+            "emotions": [],
+            "evidence": [],
+            "scores": {name: 0 for name in VALENCE_CUE_LEXICON},
+            "hits_by_emotion": {name: [] for name in VALENCE_CUE_LEXICON},
+            "summary": "Not enough text content to estimate valence or emotion.",
+        }
+
+    tokens = normalize_text_for_cues(text)
+    if not tokens:
+        return {
+            "available": False,
+            "valence": "undetermined",
+            "emotions": [],
+            "evidence": [],
+            "scores": {name: 0 for name in VALENCE_CUE_LEXICON},
+            "hits_by_emotion": {name: [] for name in VALENCE_CUE_LEXICON},
+            "summary": "The segment text does not contain enough usable lexical cues.",
+        }
+
+    scores = {
+        name: sum(token in lexicon for token in tokens)
+        for name, lexicon in VALENCE_CUE_LEXICON.items()
+    }
+    hits_by_emotion = {
+        name: sorted({token for token in tokens if token in lexicon})
+        for name, lexicon in VALENCE_CUE_LEXICON.items()
+    }
+    evidence = sorted(
+        {
+            token
+            for token in tokens
+            if any(token in lexicon for lexicon in VALENCE_CUE_LEXICON.values())
+        }
+    )
+    positive_score = scores["positive"] + scores["joy"] + scores["calm"] + max(scores["desire"] - 1, 0)
+    negative_score = scores["negative"] + scores["fear"] + scores["anger"] + scores["sadness"]
+    if positive_score == 0 and negative_score == 0:
+        valence = "undetermined"
+    elif positive_score >= negative_score * 1.5:
+        valence = "mostly positive"
+    elif negative_score >= positive_score * 1.5:
+        valence = "mostly negative"
+    else:
+        valence = "mixed"
+
+    emotion_scores = {
+        key: scores[key]
+        for key in ("joy", "fear", "desire", "anger", "sadness", "calm")
+        if scores[key] > 0
+    }
+    emotions = [key for key, _ in sorted(emotion_scores.items(), key=lambda item: (-item[1], item[0]))[:2]]
+    if emotions:
+        summary = (
+            f"The segment text suggests a {valence} valence. "
+            f"Dominant emotional cues: {', '.join(emotions)}."
+        )
+    else:
+        summary = (
+            "The segment text does not provide enough lexical evidence to "
+            "isolate one dominant emotion, even if a coarse overall valence is plausible."
+        )
+    return {
+        "available": bool(emotions or valence != "undetermined"),
+        "valence": valence,
+        "emotions": emotions,
+        "evidence": evidence[:8],
+        "scores": scores,
+        "hits_by_emotion": hits_by_emotion,
+        "summary": summary,
+    }
+
+
+def collect_run_text(run: PredictionRun) -> str:
+    pieces: list[str] = []
+    if run.raw_text:
+        pieces.append(str(run.raw_text).strip())
+    for row in collect_timestep_metadata(run):
+        text = str(row.get("text", "") or "").strip()
+        if text:
+            pieces.append(text)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for piece in pieces:
+        if piece not in seen:
+            deduped.append(piece)
+            seen.add(piece)
+    return "\n".join(deduped)
+
+
+def _roi_matches_keyword(roi: str, keyword: str) -> bool:
+    if not keyword:
+        return False
+    if roi == keyword:
+        return True
+    if not roi.startswith(keyword):
+        return False
+    if keyword[-1].isdigit():
+        if len(roi) == len(keyword):
+            return True
+        return not roi[len(keyword)].isdigit()
+    return True
+
+
+def classify_roi_family(roi: str) -> str:
+    for key, meta in ZONE_FAMILY_META.items():
+        for keyword in tp.cast(tuple[str, ...], meta["keywords"]):
+            if _roi_matches_keyword(roi, keyword):
+                return key
+    return "association_other"
+
+
+def build_roi_activity_frame(
+    signal: np.ndarray,
+    *,
+    mesh: str = "fsaverage5",
+    hemi: str = "both",
+    top_k: int | None = None,
+) -> pd.DataFrame:
+    signal = np.asarray(signal, dtype=float)
+    abs_values = summarize_by_roi(np.abs(signal), hemi=hemi, mesh=mesh)
+    signed_values = summarize_by_roi(signal, hemi=hemi, mesh=mesh)
+    labels = list(get_hcp_labels(mesh=mesh, combine=False, hemi=hemi).keys())
+    rows: list[dict[str, tp.Any]] = []
+    for roi, value, signed_value in zip(labels, abs_values, signed_values):
+        zone_key = classify_roi_family(roi)
+        zone_meta = ZONE_FAMILY_META[zone_key]
+        rows.append(
+            {
+                "roi": roi,
+                "zone_key": zone_key,
+                "zone": zone_meta["label"],
+                "value": float(value),
+                "signed_value": float(signed_value),
+                "systems": ", ".join(tp.cast(list[str], zone_meta["systems"])),
+            }
+        )
+    frame = pd.DataFrame(rows).sort_values("value", ascending=False, ignore_index=True)
+    total = float(frame["value"].sum()) if not frame.empty else 0.0
+    frame["share"] = frame["value"] / max(total, 1e-8)
+    frame["rank"] = np.arange(1, len(frame) + 1)
+    if top_k is not None:
+        return frame.head(int(top_k)).reset_index(drop=True)
+    return frame
+
+
+def build_zone_activity_frame(
+    signal: np.ndarray,
+    *,
+    mesh: str = "fsaverage5",
+    hemi: str = "both",
+) -> pd.DataFrame:
+    roi_frame = build_roi_activity_frame(signal, mesh=mesh, hemi=hemi)
+    grouped = (
+        roi_frame.groupby(["zone_key", "zone"], as_index=False)
+        .agg(
+            value=("value", "sum"),
+            signed_value=("signed_value", "mean"),
+            roi_count=("roi", "count"),
+        )
+        .sort_values("value", ascending=False, ignore_index=True)
+    )
+    total = float(grouped["value"].sum()) if not grouped.empty else 0.0
+    grouped["share"] = grouped["value"] / max(total, 1e-8)
+    grouped["systems"] = grouped["zone_key"].map(
+        lambda key: ", ".join(tp.cast(list[str], ZONE_FAMILY_META[str(key)]["systems"]))
+    )
+    grouped["rank"] = np.arange(1, len(grouped) + 1)
+    return grouped
+
+
+def build_run_roi_frame(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+    top_k: int | None = None,
+) -> pd.DataFrame:
+    aggregate_signal = np.abs(np.asarray(run.preds, dtype=float)).mean(axis=0)
+    return build_roi_activity_frame(aggregate_signal, mesh=mesh, top_k=top_k)
+
+
+def build_run_zone_frame(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+) -> pd.DataFrame:
+    aggregate_signal = np.abs(np.asarray(run.preds, dtype=float)).mean(axis=0)
+    return build_zone_activity_frame(aggregate_signal, mesh=mesh)
+
+
+def build_timestep_zone_frame(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+) -> pd.DataFrame:
+    timeline = collect_timestep_metadata(run)
+    rows: list[dict[str, tp.Any]] = []
+    for idx, signal in enumerate(run.preds):
+        zone_frame = build_zone_activity_frame(signal, mesh=mesh)
+        timing = timeline[idx] if idx < len(timeline) else {"start": idx, "duration": 1.0, "text": ""}
+        for zone_row in zone_frame.itertuples(index=False):
+            rows.append(
+                {
+                    "timestep": idx,
+                    "start_s": round(float(timing["start"]), 3),
+                    "duration_s": round(float(timing["duration"]), 3),
+                    "zone_key": zone_row.zone_key,
+                    "zone": zone_row.zone,
+                    "value": float(zone_row.value),
+                    "share": float(zone_row.share),
+                    "systems": zone_row.systems,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_selected_timestep_roi_frame(
+    run: PredictionRun,
+    *,
+    indices: list[int] | None = None,
+    mesh: str = "fsaverage5",
+    top_k: int = 10,
+) -> pd.DataFrame:
+    if indices is None:
+        summary = summarize_predictions(run.preds)
+        strongest = int(summary.sort_values("mean_abs", ascending=False).iloc[0]["timestep"])
+        indices = [0, strongest, len(run.preds) - 1]
+    selected = list(dict.fromkeys(idx for idx in indices if 0 <= idx < len(run.preds)))
+    timeline = collect_timestep_metadata(run)
+    frames: list[pd.DataFrame] = []
+    for idx in selected:
+        roi_frame = build_roi_activity_frame(run.preds[idx], mesh=mesh, top_k=top_k).copy()
+        timing = timeline[idx] if idx < len(timeline) else {"start": idx, "duration": 1.0, "text": ""}
+        roi_frame.insert(0, "timestep", idx)
+        roi_frame.insert(1, "start_s", round(float(timing["start"]), 3))
+        roi_frame.insert(2, "duration_s", round(float(timing["duration"]), 3))
+        frames.append(roi_frame)
+    if not frames:
+        return pd.DataFrame(
+            columns=["timestep", "start_s", "duration_s", "roi", "zone", "value", "share", "signed_value", "systems", "rank"]
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _normalize_emotion_lexical_scores(affect: dict[str, tp.Any]) -> dict[str, float]:
+    raw_scores = tp.cast(dict[str, int], affect.get("scores", {}))
+    return {
+        emotion: min(float(raw_scores.get(emotion, 0)) / 2.0, 1.0)
+        for emotion in EMOTION_AXES
+    }
+
+
+def build_emotion_hypothesis_frame(
+    run: PredictionRun,
+    *,
+    timestep: int | None = None,
+    mesh: str = "fsaverage5",
+) -> pd.DataFrame:
+    if timestep is None:
+        signal = np.abs(np.asarray(run.preds, dtype=float)).mean(axis=0)
+        text = collect_run_text(run)
+        summary_frame = summarize_predictions(run.preds)
+        energy_ratio = 0.5 if summary_frame.empty else 1.0
+    else:
+        signal = np.asarray(run.preds[timestep], dtype=float)
+        timing = collect_timestep_metadata(run)
+        text = timing[timestep]["text"] if timestep < len(timing) else collect_run_text(run)
+        summary_frame = summarize_predictions(run.preds)
+        peak = max(float(summary_frame["mean_abs"].max()), 1e-8)
+        energy_ratio = float(summary_frame.loc[summary_frame["timestep"] == timestep, "mean_abs"].iloc[0]) / peak
+
+    zone_frame = build_zone_activity_frame(signal, mesh=mesh)
+    affect = infer_affective_cues(text)
+    lexical_scores = _normalize_emotion_lexical_scores(affect)
+    has_lexical_signal = any(score > 0 for score in lexical_scores.values())
+    modality_prior = EMOTION_MODALITY_PRIORS.get(run.input_kind, EMOTION_MODALITY_PRIORS["multimodal"])
+    rows: list[dict[str, tp.Any]] = []
+    for emotion in EMOTION_AXES:
+        zone_score = 0.0
+        zone_drivers: list[tuple[str, float]] = []
+        for zone_row in zone_frame.itertuples(index=False):
+            weight = ZONE_EMOTION_WEIGHTS.get(str(zone_row.zone_key), ZONE_EMOTION_WEIGHTS["association_other"])[emotion]
+            contribution = float(zone_row.share) * float(weight)
+            zone_score += contribution
+            if contribution > 0:
+                zone_drivers.append((str(zone_row.zone), contribution))
+        zone_score = min(zone_score / 0.34, 1.0)
+        lexical_score = lexical_scores[emotion]
+        prior_score = float(modality_prior[emotion])
+        if has_lexical_signal:
+            score = (0.58 * lexical_score) + (0.30 * zone_score) + (0.12 * prior_score)
+        else:
+            score = (0.76 * zone_score) + (0.24 * prior_score)
+        if emotion == "calm":
+            score *= 0.9 + (0.18 * (1.0 - energy_ratio))
+        elif emotion in {"fear", "anger", "joy", "desire"}:
+            score += 0.06 * energy_ratio
+        elif emotion == "sadness":
+            score += 0.03 * (1.0 - abs(energy_ratio - 0.45))
+        score = float(np.clip(score, 0.0, 1.0))
+        lexical_hits = tp.cast(dict[str, list[str]], affect.get("hits_by_emotion", {})).get(emotion, [])
+        driver_labels = [label for label, _ in sorted(zone_drivers, key=lambda item: item[1], reverse=True)[:3]]
+        rows.append(
+            {
+                "emotion": emotion,
+                "label": EMOTION_LABELS[emotion],
+                "score": score,
+                "lexical_score": float(lexical_score),
+                "zone_score": float(zone_score),
+                "modality_prior": float(prior_score),
+                "top_zone_drivers": ", ".join(driver_labels),
+                "lexical_hits": ", ".join(lexical_hits),
+            }
+        )
+    frame = pd.DataFrame(rows).sort_values("score", ascending=False, ignore_index=True)
+    frame["score_pct"] = (frame["score"] * 100.0).round(1)
+    return frame
+
+
+def build_zone_overview_payload(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+    selected_indices: list[int] | None = None,
+) -> dict[str, tp.Any]:
+    zone_frame = build_run_zone_frame(run, mesh=mesh)
+    roi_frame = build_run_roi_frame(run, mesh=mesh)
+    timestep_zone_frame = build_timestep_zone_frame(run, mesh=mesh)
+    timestep_roi_frame = build_selected_timestep_roi_frame(
+        run,
+        indices=selected_indices,
+        mesh=mesh,
+        top_k=10,
+    )
+    emotion_frame = build_emotion_hypothesis_frame(run, mesh=mesh)
+    return {
+        "cortical_surface_note": (
+            "Les tableaux par zone utilisent le maillage cortical fsaverage5 et l'atlas HCP-MMP. "
+            "Ils decrivent uniquement des ROIs corticales, pas des structures sous-corticales."
+        ),
+        "run_zone_summary": zone_frame.to_dict(orient="records"),
+        "run_top_rois": roi_frame.head(24).to_dict(orient="records"),
+        "zone_timeseries": timestep_zone_frame.to_dict(orient="records"),
+        "selected_timestep_rois": timestep_roi_frame.to_dict(orient="records"),
+        "emotion_hypotheses": emotion_frame.to_dict(orient="records"),
+    }
+
+
+def infer_region_profile(
+    description: dict[str, tp.Any],
+    *,
+    input_kind: str,
+) -> dict[str, tp.Any]:
+    """Translate coarse spatial axes into conservative functional hypotheses."""
+    ap = description["antero_posterior"]
+    dv = description["dorso_ventral"]
+    lat = description["laterality"]
+
+    if ap == "posterior":
+        if dv == "dorsal":
+            zone = "dorsal occipito-parietal cortex"
+            systems = ["spatial vision", "visual motion", "visuospatial attention"]
+        elif dv == "ventral":
+            zone = "ventral occipito-temporal cortex"
+            systems = ["ventral visual pathway", "shapes, objects, scenes, or faces"]
+        else:
+            zone = "posterior occipital cortex"
+            systems = ["early visual processing", "global image or scene structure"]
+    elif ap == "central":
+        if dv == "dorsal":
+            zone = "dorsal parietal cortex"
+            systems = ["attention", "multisensory integration", "perception-action coordination"]
+        elif dv == "ventral":
+            zone = "lateral/ventral temporal cortex"
+            systems = ["audition or speech", "semantics", "social or narrative cues"]
+        else:
+            zone = "temporo-parietal junction"
+            systems = ["context integration", "bridge from sensory content to interpretation"]
+    else:
+        if dv == "dorsal":
+            zone = "dorsal frontal cortex"
+            systems = ["attentional control", "planning", "context maintenance"]
+        elif dv == "ventral":
+            zone = "ventral fronto-temporal cortex"
+            systems = ["meaning evaluation", "socio-affective context", "value integration"]
+        else:
+            zone = "prefrontal cortex"
+            systems = ["high-level integration", "context", "prediction or decision"]
+
+    modality_hint = {
+        "video": "This profile is compatible with a mix of visual, acoustic, and linguistic cues.",
+        "audio": "This profile should mostly be read as a response to auditory content and, when present, speech.",
+        "text": "This profile should mostly be read as a response to linguistic content and semantic context.",
+        "image": "This profile should mostly be read as a response to static visual content.",
+        "multimodal": "This profile combines several modalities and should be read as a visual, auditory, and/or linguistic superposition.",
+    }[input_kind]
+
+    if lat == "left":
+        lateral_note = "Left lateralization can be compatible with language or more sequential processing, without being specific."
+    elif lat == "right":
+        lateral_note = "Right lateralization can be compatible with prosody, global scene structure, or socio-affective cues, without being specific."
+    else:
+        lateral_note = "Bilateral involvement suggests more distributed or multisensory processing."
+
+    return {
+        "zone": f"{zone}, leaning {lat}",
+        "systems": systems,
+        "modality_hint": modality_hint,
+        "lateral_note": lateral_note,
+    }
+
+
+def build_result_interpretation(
+    run: PredictionRun,
+    *,
+    timestep: int,
+    description: dict[str, tp.Any] | None = None,
+    segment_text: str | None = None,
+) -> dict[str, tp.Any]:
+    """Explain one result with cautious functional and affective hypotheses."""
+    description = description or describe_timestep(run.preds, timestep=timestep)
+    region = infer_region_profile(description, input_kind=run.input_kind)
+    if segment_text is None:
+        if timestep < len(run.segments):
+            segment_text = get_segment_text(run.segments[timestep])
+        elif run.input_kind == "text":
+            segment_text = run.raw_text or ""
+    affect = infer_affective_cues(segment_text)
+
+    if affect["available"]:
+        affect_summary = (
+            f"The current stimulus looks {affect['valence']}; "
+            f"emotional cues: {', '.join(affect['emotions']) if affect['emotions'] else 'not strongly dominant'}."
+        )
+    else:
+        affect_summary = (
+            "No reliable fear/desire/joy-style reading should be inferred from the map alone; "
+            "there are not enough clear text cues here."
+        )
+
+    summary = (
+        f"Likely dominant zone: {region['zone']}. "
+        f"This pattern is compatible with {', '.join(region['systems'][:2])}. "
+        f"{affect_summary}"
+    )
+    cautions = [
+        "The zones and functions proposed here are coarse hypotheses from predicted topography, not clinical localization.",
+        "Affective labels come from aligned stimulus text when it exists; they are not decoded directly from the brain map.",
+    ]
+    return {
+        "zone": region["zone"],
+        "systems": region["systems"],
+        "modality_hint": region["modality_hint"],
+        "lateral_note": region["lateral_note"],
+        "affect": affect,
+        "summary": summary,
+        "cautions": cautions,
+    }
+
+
+def build_timestep_reports(
+    run: PredictionRun,
+    *,
+    indices: list[int] | None = None,
+) -> list[dict[str, tp.Any]]:
+    """Build a structured interpretation row for each timestep."""
+    metadata = collect_timestep_metadata(run)
+    if indices is None:
+        indices = list(range(len(run.preds)))
+    rows: list[dict[str, tp.Any]] = []
+    if isinstance(run, MultiModalRun):
+        summary = summarize_predictions(run.preds).set_index("timestep")
+        for idx in indices:
+            meta = metadata[idx]
+            _, channel_labels, _, matched_indices = _build_multimodal_overlay_signals(
+                run,
+                timestep=idx,
+            )
+            channel_text = ", ".join(MULTIMODAL_CHANNEL_LABELS[label] for label in channel_labels) or "Fusion"
+            aligned_text = ", ".join(
+                f"{MULTIMODAL_SOURCE_LABELS.get(modality, modality)} t{matched_idx}"
+                for modality, matched_idx in matched_indices.items()
+            )
+            row = summary.loc[idx]
+            rows.append(
+                {
+                    "timestep": idx,
+                    "start_s": round(float(meta["start"]), 3),
+                    "duration_s": round(float(meta["duration"]), 3),
+                    "text": meta["text"],
+                    "summary": f"Multimodal overlay {channel_text}.",
+                    "zone": "Multimodal fusion",
+                    "systems": channel_text,
+                    "valence": "undetermined",
+                    "emotions": "",
+                    "evidence": aligned_text or f"mean_abs={float(row['mean_abs']):.4f}",
+                }
+            )
+        return rows
+    for idx in indices:
+        meta = metadata[idx]
+        description = describe_timestep(run.preds, timestep=idx)
+        interpretation = build_result_interpretation(
+            run,
+            timestep=idx,
+            description=description,
+            segment_text=meta["text"],
+        )
+        rows.append(
+            {
+                "timestep": idx,
+                "start_s": round(float(meta["start"]), 3),
+                "duration_s": round(float(meta["duration"]), 3),
+                "text": meta["text"],
+                "summary": description["summary"],
+                "zone": interpretation["zone"],
+                "systems": ", ".join(interpretation["systems"]),
+                "valence": interpretation["affect"]["valence"],
+                "emotions": ", ".join(interpretation["affect"]["emotions"]),
+                "evidence": ", ".join(interpretation["affect"]["evidence"]),
+            }
+        )
+    return rows
+
+
+def build_timestep_report_frame(run: PredictionRun) -> pd.DataFrame:
+    """Tabular view of per-timestep interpretations."""
+    return pd.DataFrame(build_timestep_reports(run))
+
+
+def render_brain_figure(
+    preds: np.ndarray,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = None,
+) -> plt.Figure:
+    """Render a static cortical figure for one predicted timestep."""
+    if timestep < 0 or timestep >= len(preds):
+        raise IndexError(f"Invalid timestep {timestep} for predictions of length {len(preds)}.")
+
+    plotter = PlotBrainNilearn(mesh=mesh)
+    fig, axes = plotter.get_fig_axes(list(views))
+    plotter.plot_surf(
+        preds[timestep],
+        axes=axes,
+        views=list(views),
+        cmap=cmap,
+        norm_percentile=norm_percentile,
+        vmin=vmin,
+    )
+    fig.suptitle(f"Predicted activity at timestep {timestep}", fontsize=14, y=0.98)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.90, wspace=0.02, hspace=0.02)
+    return fig
+
+
+def _get_timestep_row(run: PredictionRun, timestep: int) -> dict[str, tp.Any]:
+    metadata = collect_timestep_metadata(run)
+    if not metadata:
+        return {"index": timestep, "start": float(timestep), "duration": 1.0, "text": ""}
+    safe_index = max(0, min(timestep, len(metadata) - 1))
+    return metadata[safe_index]
+
+
+def _get_multimodal_channel(modality: str) -> str:
+    if modality in {"video", "image"}:
+        return "visual"
+    if modality == "audio":
+        return "audio"
+    return "text"
+
+
+def _build_multimodal_overlay_signals(
+    run: MultiModalRun,
+    *,
+    timestep: int,
+    norm_percentile: int | None = 99,
+) -> tuple[list[np.ndarray], list[str], np.ndarray, dict[str, int]]:
+    target = _get_timestep_row(run, timestep)
+    target_center = float(target["start"]) + (float(target["duration"]) / 2.0)
+    grouped: dict[str, list[np.ndarray]] = {channel: [] for channel in MULTIMODAL_CHANNEL_ORDER}
+    matched_indices: dict[str, int] = {}
+
+    for modality, component_run in run.component_runs.items():
+        metadata = collect_timestep_metadata(component_run)
+        if len(component_run.preds) == 0:
+            continue
+        if metadata:
+            centers = np.array(
+                [float(row["start"]) + (float(row["duration"]) / 2.0) for row in metadata],
+                dtype=float,
+            )
+            component_index = int(np.argmin(np.abs(centers - target_center)))
+        else:
+            component_index = min(timestep, len(component_run.preds) - 1)
+        matched_indices[modality] = component_index
+        signal = np.abs(np.asarray(component_run.preds[component_index], dtype=float))
+        if norm_percentile is not None:
+            signal = normalize_signal_for_display(signal, percentile=norm_percentile)
+        signal = np.clip(np.nan_to_num(signal, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        grouped[_get_multimodal_channel(modality)].append(signal)
+
+    channel_signals: list[np.ndarray] = []
+    channel_labels: list[str] = []
+    for channel in MULTIMODAL_CHANNEL_ORDER:
+        signals = grouped[channel]
+        if not signals:
+            continue
+        if len(signals) == 1:
+            merged = signals[0]
+        else:
+            merged = np.mean(np.stack(signals, axis=0), axis=0)
+        channel_signals.append(np.clip(merged, 0.0, 1.0))
+        channel_labels.append(channel)
+
+    if channel_signals:
+        alpha_signal = np.max(np.stack(channel_signals, axis=0), axis=0)
+    else:
+        alpha_signal = np.zeros(run.preds.shape[1], dtype=float)
+    return channel_signals, channel_labels, np.clip(alpha_signal, 0.0, 1.0), matched_indices
+
+
+def _get_multimodal_surface_render_data(
+    run: MultiModalRun,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    norm_percentile: int | None = 99,
+    surface_smoothing_passes: int = 1,
+    surface_smoothing_blend: float = 0.28,
+) -> tuple[PlotBrainPyvista, np.ndarray, np.ndarray, np.ndarray, list[str], dict[str, int]] | None:
+    channel_signals, channel_labels, alpha_signal, matched_indices = _build_multimodal_overlay_signals(
+        run,
+        timestep=timestep,
+        norm_percentile=norm_percentile,
+    )
+    if len(channel_signals) < 2:
+        return None
+
+    plotter = get_pyvista_plotter(mesh)
+    smoothed_channels = [
+        _smooth_surface_values(
+            signal,
+            mesh=mesh,
+            passes=surface_smoothing_passes,
+            blend=surface_smoothing_blend,
+        )
+        for signal in channel_signals
+    ]
+    smoothed_alpha = _smooth_surface_values(
+        alpha_signal,
+        mesh=mesh,
+        passes=surface_smoothing_passes,
+        blend=surface_smoothing_blend,
+    )
+    hemis = [plotter.get_hemis(signal) for signal in smoothed_channels]
+    alpha_hemis = plotter.get_hemis(smoothed_alpha)
+    both_colors: np.ndarray | None = None
+    bg_cmap = plt.get_cmap("gray_r")
+    for selected_hemi in ("left", "right", "both"):
+        stat_maps = [hemi[selected_hemi]["stat_map"] for hemi in hemis]
+        colors = np.stack(stat_maps, axis=1)
+        if colors.shape[1] == 2:
+            colors = np.concatenate([colors, np.zeros((colors.shape[0], 1))], axis=1)
+        colors = np.clip(colors, 0.0, 1.0)
+        alpha = np.clip(alpha_hemis[selected_hemi]["stat_map"][:, None], 0.0, 1.0)
+        bg_map = hemis[0][selected_hemi]["bg_map"]
+        bg_norm = (bg_map - bg_map.min()) / (bg_map.max() - bg_map.min() + 1e-8)
+        bg_rgba = bg_cmap(bg_norm)
+        rgba = np.concatenate([colors, np.ones((colors.shape[0], 1))], axis=1)
+        rgba[:, :3] = rgba[:, :3] * alpha + bg_rgba[:, :3] * (1.0 - alpha)
+        if selected_hemi == "both":
+            both_colors = rgba
+
+    mesh_data = plotter._mesh["both"]
+    assert both_colors is not None
+    return (
+        plotter,
+        mesh_data["coords"],
+        mesh_data["faces"],
+        both_colors,
+        channel_labels,
+        matched_indices,
+    )
+
+
+def render_multimodal_brain_panel_image(
+    run: MultiModalRun,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    norm_percentile: int = 99,
+) -> np.ndarray:
+    plotter = get_pyvista_plotter(mesh)
+    channel_signals, _, alpha_signal, _ = _build_multimodal_overlay_signals(
+        run,
+        timestep=timestep,
+        norm_percentile=norm_percentile,
+    )
+    if len(channel_signals) < 2:
+        return render_brain_panel_image(
+            run.preds,
+            timestep=timestep,
+            mesh=mesh,
+            views=views,
+            cmap="fire",
+            norm_percentile=norm_percentile,
+            vmin=0.5,
+        )
+    fig, axes = plt.subplots(
+        1,
+        len(views),
+        figsize=(2.2 * len(views), 2.1),
+        squeeze=False,
+    )
+    flat_axes = list(axes.flatten())
+    plotter.plot_surf_rgb(
+        channel_signals,
+        alpha_signals=alpha_signal,
+        norm_percentile=None,
+        axes=flat_axes,
+        views=list(views),
+    )
+    for ax in flat_axes:
+        ax.axis("off")
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, wspace=0.01, hspace=0.01)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight", pad_inches=0.0)
+    plt.close(fig)
+    buffer.seek(0)
+    return np.array(Image.open(buffer).convert("RGB"))
+
+
+def render_run_panel_image(
+    run: PredictionRun,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+    display_reference: np.ndarray | None = None,
+) -> np.ndarray:
+    if isinstance(run, MultiModalRun):
+        return render_multimodal_brain_panel_image(
+            run,
+            timestep=timestep,
+            mesh=mesh,
+            views=views,
+            norm_percentile=norm_percentile,
+        )
+    return render_brain_panel_image(
+        run.preds,
+        timestep=timestep,
+        mesh=mesh,
+        views=views,
+        cmap=cmap,
+        norm_percentile=norm_percentile,
+        vmin=vmin,
+        display_reference=display_reference,
+    )
+
+
+def render_run_panel_bytes(
+    run: PredictionRun,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+    image_format: str = "JPEG",
+    quality: int = 84,
+    display_reference: np.ndarray | None = None,
+) -> bytes:
+    image = Image.fromarray(
+        render_run_panel_image(
+            run,
+            timestep=timestep,
+            mesh=mesh,
+            views=views,
+            cmap=cmap,
+            norm_percentile=norm_percentile,
+            vmin=vmin,
+            display_reference=display_reference,
+        )
+    )
+    buffer = io.BytesIO()
+    save_kwargs: dict[str, tp.Any] = {}
+    if image_format.upper() == "JPEG":
+        image = image.convert("RGB")
+        save_kwargs.update({"quality": quality, "optimize": True})
+    image.save(buffer, format=image_format.upper(), **save_kwargs)
+    return buffer.getvalue()
+
+
+def render_prediction_mosaic(
+    run: PredictionRun,
+    *,
+    max_timesteps: int = 6,
+    mesh: str = "fsaverage5",
+    show_stimuli: bool = True,
+    display_reference: np.ndarray | None = None,
+) -> plt.Figure:
+    """Render a compact multi-timestep figure for the app."""
+    n_timesteps = min(max_timesteps, len(run.preds))
+    if n_timesteps < 1:
+        raise ValueError("Cannot render a mosaic for an empty prediction run.")
+    allow_frames = bool(
+        show_stimuli and run.segments and any(has_video(seg) for seg in run.segments[:n_timesteps])
+    )
+    n_rows = 2 if allow_frames else 1
+    row_heights = [1.2, 0.9] if allow_frames else [1.0]
+    fig, axes = plt.subplots(
+        n_rows,
+        n_timesteps,
+        figsize=(3.15 * n_timesteps, 2.85 * n_rows),
+        squeeze=False,
+        gridspec_kw={"height_ratios": row_heights},
+    )
+    for idx in range(n_timesteps):
+        brain_img = render_run_panel_image(
+            run,
+            timestep=idx,
+            mesh=mesh,
+            vmin=0.5,
+            display_reference=display_reference,
+        )
+        brain_ax = axes[0, idx]
+        brain_ax.imshow(brain_img)
+        brain_ax.axis("off")
+        brain_ax.set_title(f"t={idx}s", fontsize=10, pad=6)
+
+        if allow_frames:
+            stim_ax = axes[1, idx]
+            stim_ax.axis("off")
+            clip = get_clip(run.segments[idx]) if idx < len(run.segments) else None
+            if clip is not None:
+                try:
+                    sample_time = min(max(clip.duration / 2, 0), max(clip.duration - 1e-3, 0))
+                    stim_ax.imshow(clip.get_frame(sample_time))
+                finally:
+                    clip.close()
+            text = get_segment_text(run.segments[idx]) if idx < len(run.segments) else None
+            if text:
+                trimmed = text.strip()
+                if len(trimmed) > 64:
+                    trimmed = trimmed[:61] + "..."
+                stim_ax.text(
+                    0.5,
+                    -0.08,
+                    trimmed,
+                    ha="center",
+                    va="top",
+                    transform=stim_ax.transAxes,
+                    fontsize=8,
+                    wrap=True,
+                )
+
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.93, bottom=0.07, wspace=0.04, hspace=0.18)
+    return fig
+
+
+def render_brain_panel_image(
+    preds: np.ndarray,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+    display_reference: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render one timestep as a compact RGB image for mosaics and synced playback."""
+    if timestep < 0 or timestep >= len(preds):
+        raise IndexError(f"Invalid timestep {timestep} for predictions of length {len(preds)}.")
+    plotter = get_pyvista_plotter(mesh)
+    signal = preds[timestep]
+    if norm_percentile is not None:
+        signal = normalize_signal_for_display(
+            signal,
+            percentile=norm_percentile,
+            reference_signal=display_reference,
+        )
+    fig, axes = plt.subplots(
+        1,
+        len(views),
+        figsize=(2.2 * len(views), 2.1),
+        squeeze=False,
+    )
+    flat_axes = list(axes.flatten())
+    plotter.plot_surf(
+        signal,
+        axes=flat_axes,
+        views=list(views),
+        cmap=cmap,
+        norm_percentile=None,
+        vmin=vmin,
+    )
+    for ax in flat_axes:
+        ax.axis("off")
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01, wspace=0.01, hspace=0.01)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight", pad_inches=0.0)
+    plt.close(fig)
+    buffer.seek(0)
+    return np.array(Image.open(buffer).convert("RGB"))
+
+
+def render_brain_panel_bytes(
+    preds: np.ndarray,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    views: tuple[str, ...] = ("left", "right", "dorsal"),
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+    image_format: str = "JPEG",
+    quality: int = 84,
+    display_reference: np.ndarray | None = None,
+) -> bytes:
+    """Render one timestep to bytes for browser playback widgets."""
+    image = Image.fromarray(
+        render_brain_panel_image(
+            preds,
+            timestep=timestep,
+            mesh=mesh,
+            views=views,
+            cmap=cmap,
+            norm_percentile=norm_percentile,
+            vmin=vmin,
+            display_reference=display_reference,
+        )
+    )
+    buffer = io.BytesIO()
+    save_kwargs: dict[str, tp.Any] = {}
+    if image_format.upper() == "JPEG":
+        image = image.convert("RGB")
+        save_kwargs.update({"quality": quality, "optimize": True})
+    image.save(buffer, format=image_format.upper(), **save_kwargs)
+    return buffer.getvalue()
+
+
+def _annotate_frame_with_timestep(image: Image.Image, timestep: int) -> Image.Image:
+    """Overlay a compact timestep badge in the lower-left corner."""
+    frame = image.convert("RGBA")
+    draw = ImageDraw.Draw(frame, "RGBA")
+    font = ImageFont.load_default()
+    label = f"t={timestep}"
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    pad_x = max(8, frame.width // 110)
+    pad_y = max(5, frame.height // 160)
+    margin_x = max(10, frame.width // 36)
+    margin_y = max(10, frame.height // 30)
+    x = margin_x
+    y = max(0, frame.height - margin_y - text_height - (pad_y * 2))
+    draw.rounded_rectangle(
+        (
+            x - pad_x,
+            y - pad_y,
+            x + text_width + pad_x,
+            y + text_height + pad_y,
+        ),
+        radius=max(8, frame.height // 80),
+        fill=(15, 23, 34, 190),
+        outline=(255, 255, 255, 42),
+        width=1,
+    )
+    draw.text((x, y), label, font=font, fill=(255, 248, 242, 255))
+    return frame.convert("RGB")
+
+
+def render_prediction_gif(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+    max_frames: int = 72,
+    vmin: float | None = 0.5,
+    display_reference: np.ndarray | None = None,
+) -> bytes:
+    """Render a looping animated GIF of predicted brain activity."""
+    indices = select_animation_indices(len(run.preds), max_frames=max_frames)
+    if not indices:
+        raise ValueError("Cannot render an animation for an empty prediction run.")
+    frames = [
+        _annotate_frame_with_timestep(
+            Image.fromarray(
+                render_run_panel_image(
+                    run,
+                    timestep=idx,
+                    mesh=mesh,
+                    vmin=vmin,
+                    display_reference=display_reference,
+                )
+            ),
+            idx,
+        ).convert("P", palette=Image.ADAPTIVE)
+        for idx in indices
+    ]
+    timeline = collect_timestep_metadata(run)
+    durations = [
+        int(max(160, min(1200, round(float(timeline[idx]["duration"]) * 1000))))
+        for idx in indices
+    ]
+    buffer = io.BytesIO()
+    frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        disposal=2,
+    )
+    return buffer.getvalue()
+
+
+@lru_cache(maxsize=8)
+def _get_mesh_face_smoothing_cache(mesh: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    plotter = get_pyvista_plotter(mesh)
+    mesh_data = plotter._mesh["both"]
+    faces = mesh_data["faces"].astype(np.int32)
+    flat_faces = faces.reshape(-1)
+    counts = np.bincount(flat_faces, minlength=mesh_data["coords"].shape[0]).astype(float)
+    counts[counts == 0] = 1.0
+    return faces, flat_faces, counts
+
+
+def _smooth_surface_values(
+    values: np.ndarray,
+    *,
+    mesh: str = "fsaverage5",
+    passes: int = 1,
+    blend: float = 0.32,
+) -> np.ndarray:
+    if passes <= 0 or blend <= 0:
+        return np.asarray(values, dtype=float)
+
+    faces, flat_faces, counts = _get_mesh_face_smoothing_cache(mesh)
+    arr = np.asarray(values, dtype=float)
+    squeeze = arr.ndim == 1
+    if squeeze:
+        arr = arr[:, None]
+
+    smoothed = arr.copy()
+    for _ in range(passes):
+        face_means = smoothed[faces].mean(axis=1)
+        repeated = np.repeat(face_means, 3, axis=0)
+        vertex_means = np.empty_like(smoothed)
+        for column in range(smoothed.shape[1]):
+            vertex_means[:, column] = (
+                np.bincount(flat_faces, weights=repeated[:, column], minlength=counts.shape[0])
+                / counts
+            )
+        smoothed = (1.0 - blend) * smoothed + blend * vertex_means
+
+    if squeeze:
+        return smoothed[:, 0]
+    return smoothed
+
+
+def _get_surface_render_data(
+    signal: np.ndarray,
+    *,
+    mesh: str = "fsaverage5",
+    cmap: str = "fire",
+    norm_percentile: int | None = 99,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    threshold: float | None = None,
+    symmetric_cbar: bool = False,
+    display_reference: np.ndarray | None = None,
+    surface_smoothing_passes: int = 0,
+    surface_smoothing_blend: float = 0.0,
+) -> tuple[PlotBrainPyvista, np.ndarray, np.ndarray, np.ndarray]:
+    plotter = get_pyvista_plotter(mesh)
+    if norm_percentile is not None:
+        signal = normalize_signal_for_display(
+            signal,
+            percentile=norm_percentile,
+            reference_signal=display_reference,
+        )
+    mesh_data = plotter._mesh["both"]
+    stat_map = plotter.get_stat_map(signal)["both"]
+    stat_map = _smooth_surface_values(
+        stat_map,
+        mesh=mesh,
+        passes=surface_smoothing_passes,
+        blend=surface_smoothing_blend,
+    )
+    sm = get_scalar_mappable(
+        signal,
+        get_cmap(cmap),
+        vmin=vmin,
+        vmax=vmax,
+        threshold=threshold,
+        symmetric_cbar=symmetric_cbar,
+    )
+    rgba = sm.to_rgba(stat_map)
+    bg_map = mesh_data["bg_map"]
+    bg_norm = (bg_map - bg_map.min()) / (bg_map.max() - bg_map.min() + 1e-8)
+    bg_rgb = 1 - np.column_stack(
+        [plotter.bg_darkness + bg_norm * (1 - plotter.bg_darkness)] * 3
+    )
+    colors = rgba[:, 3:4] * rgba[:, :3] + (1 - rgba[:, 3:4]) * bg_rgb
+    return plotter, mesh_data["coords"], mesh_data["faces"], colors
+
+
+def render_interactive_brain_html(
+    preds: np.ndarray,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    cmap: str = "fire",
+    norm_percentile: int | None = 99,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    threshold: float | None = None,
+    symmetric_cbar: bool = False,
+    width: int = 980,
+    height: int = 700,
+    surface_smoothing_passes: int = 1,
+    surface_smoothing_blend: float = 0.26,
+) -> str:
+    """Render one timestep as an interactive PyVista HTML scene."""
+    if timestep < 0 or timestep >= len(preds):
+        raise IndexError(f"Invalid timestep {timestep} for predictions of length {len(preds)}.")
+
+    import pyvista as pv
+
+    _, vertices, faces, colors = _get_surface_render_data(
+        preds[timestep],
+        mesh=mesh,
+        cmap=cmap,
+        norm_percentile=norm_percentile,
+        vmin=vmin,
+        vmax=vmax,
+        threshold=threshold,
+        symmetric_cbar=symmetric_cbar,
+        surface_smoothing_passes=surface_smoothing_passes,
+        surface_smoothing_blend=surface_smoothing_blend,
+    )
+    pv_faces = np.column_stack([np.full(len(faces), 3), faces]).astype(np.int64)
+    surface = pv.PolyData(vertices, pv_faces)
+    surface.point_data["colors"] = colors
+
+    plotter = pv.Plotter(off_screen=True, window_size=[width, height])
+    plotter.add_mesh(
+        surface,
+        scalars="colors",
+        rgb=True,
+        smooth_shading=True,
+        ambient=0.3,
+    )
+    plotter.set_background("white")
+    plotter.view_vector([-1, 0, 0], viewup=[0, 0, 1])
+    plotter.camera.zoom(1.35)
+    html = plotter.export_html(None).getvalue()
+    plotter.close()
+    return html
+
+
+def _cmap_to_plotly_colorscale(cmap_name: str = "fire", n: int = 12) -> list[list[tp.Any]]:
+    cmap = get_cmap(cmap_name)
+    scale: list[list[tp.Any]] = []
+    for idx, value in enumerate(np.linspace(0, 1, n)):
+        rgba = cmap(value)
+        rgb = tuple(int(channel * 255) for channel in rgba[:3])
+        scale.append([round(idx / max(n - 1, 1), 6), f"rgb{rgb}"])
+    return scale
+
+
+def render_animated_brain_3d_html(
+    run: PredictionRun,
+    *,
+    mesh: str = "fsaverage5",
+    max_frames: int = 30,
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+    width: int = 980,
+    height: int = 760,
+    display_reference: np.ndarray | None = None,
+    surface_smoothing_passes: int = 2,
+    surface_smoothing_blend: float = 0.34,
+) -> str:
+    """Render a rotatable 3D brain animation with play/pause controls."""
+    from plotly.offline import get_plotlyjs
+
+    indices = select_animation_indices(len(run.preds), max_frames=max_frames)
+    if not indices:
+        raise ValueError("Cannot render a 3D animation for an empty prediction run.")
+
+    plotter = get_pyvista_plotter(mesh)
+    mesh_data = plotter._mesh["both"]
+    coords = np.round(mesh_data["coords"], 3)
+    faces = mesh_data["faces"].astype(int)
+    timeline = collect_timestep_metadata(run)
+    frames: list[dict[str, tp.Any]] = []
+    reports = build_timestep_reports(run, indices=indices) if not isinstance(run, MultiModalRun) else None
+    for frame_offset, idx in enumerate(indices):
+        if isinstance(run, MultiModalRun):
+            multimodal_surface = _get_multimodal_surface_render_data(
+                run,
+                timestep=idx,
+                mesh=mesh,
+                norm_percentile=norm_percentile,
+                surface_smoothing_passes=surface_smoothing_passes,
+                surface_smoothing_blend=max(0.18, surface_smoothing_blend - 0.06),
+            )
+            if multimodal_surface is None:
+                _, _, _, colors = _get_surface_render_data(
+                    run.preds[idx],
+                    mesh=mesh,
+                    norm_percentile=norm_percentile,
+                    cmap="fire",
+                    vmin=vmin,
+                    display_reference=display_reference,
+                    surface_smoothing_passes=surface_smoothing_passes,
+                    surface_smoothing_blend=surface_smoothing_blend,
+                )
+                report = {
+                    "text": timeline[idx]["text"],
+                    "summary": "Multimodal fusion is available, but only one modality family contributes visibly at this timestep.",
+                    "zone": "Multimodal fusion",
+                    "valence": "undetermined",
+                }
+            else:
+                _, _, _, colors, channel_labels, matched_indices = multimodal_surface
+                label_text = ", ".join(MULTIMODAL_CHANNEL_LABELS[label] for label in channel_labels)
+                matched_text = ", ".join(
+                    f"{MULTIMODAL_SOURCE_LABELS.get(modality, modality)} t{matched_idx}"
+                    for modality, matched_idx in matched_indices.items()
+                )
+                report = {
+                    "text": timeline[idx]["text"],
+                    "summary": f"Multimodal overlay {label_text}. Current alignment: {matched_text}.",
+                    "zone": "Multimodal fusion",
+                    "valence": "undetermined",
+                }
+        else:
+            report = tp.cast(list[dict[str, tp.Any]], reports)[frame_offset]
+            _, _, _, colors = _get_surface_render_data(
+                run.preds[idx],
+                mesh=mesh,
+                norm_percentile=norm_percentile,
+                cmap="fire",
+                vmin=vmin,
+                display_reference=display_reference,
+                surface_smoothing_passes=surface_smoothing_passes,
+                surface_smoothing_blend=surface_smoothing_blend,
+            )
+        frames.append(
+            {
+                "index": idx,
+                "start": timeline[idx]["start"],
+                "duration": timeline[idx]["duration"],
+                "text": report["text"],
+                "summary": report["summary"],
+                "zone": report["zone"],
+                "valence": report["valence"],
+                "vertexcolor": np.round(colors * 255).astype(int).tolist(),
+            }
+        )
+
+    payload = {
+        "x": coords[:, 0].tolist(),
+        "y": coords[:, 1].tolist(),
+        "z": coords[:, 2].tolist(),
+        "i": faces[:, 0].tolist(),
+        "j": faces[:, 1].tolist(),
+        "k": faces[:, 2].tolist(),
+        "frames": frames,
+        "frameDurationMs": max(
+            180,
+            int(
+                np.median(
+                    [
+                        max(160, min(1200, round(float(frame["duration"]) * 1000)))
+                        for frame in frames
+                    ]
+                )
+            ),
+        ),
+        "transitionMs": 220,
+        "height": height,
+    }
+    payload_json = json.dumps(payload)
+    plotly_js = get_plotlyjs()
+
+    return f"""
+    <div style="font-family: ui-sans-serif, system-ui, sans-serif; color: #171717;">
+      <style>
+        .brain3d-wrap {{
+          border: 1px solid rgba(23, 23, 23, 0.10);
+          border-radius: 18px;
+          padding: 14px;
+          background: rgba(255, 250, 242, 0.94);
+          box-shadow: 0 8px 20px rgba(23, 23, 23, 0.05);
+        }}
+        .brain3d-toolbar {{
+          display: flex;
+          justify-content: space-between;
+          gap: 14px;
+          flex-wrap: wrap;
+          margin-bottom: 12px;
+          align-items: center;
+        }}
+        .brain3d-controls {{
+          display: flex;
+          gap: 10px;
+          align-items: center;
+          flex-wrap: wrap;
+        }}
+        .brain3d-btn {{
+          border: 1px solid rgba(23, 23, 23, 0.12);
+          border-radius: 999px;
+          background: white;
+          padding: 8px 14px;
+          cursor: pointer;
+          transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+          box-shadow: 0 4px 10px rgba(23, 23, 23, 0.04);
+        }}
+        .brain3d-btn:hover {{
+          transform: translateY(-1px);
+          box-shadow: 0 8px 18px rgba(23, 23, 23, 0.09);
+        }}
+        .brain3d-badge {{
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          border-radius: 999px;
+          padding: 8px 12px;
+          font-size: 12px;
+          font-weight: 600;
+          letter-spacing: 0.02em;
+          color: #74341a;
+          background: rgba(183, 67, 22, 0.10);
+          border: 1px solid rgba(183, 67, 22, 0.15);
+        }}
+        .brain3d-badge-live {{
+          color: #8d2500;
+          background: linear-gradient(135deg, rgba(255, 155, 92, 0.28), rgba(183, 67, 22, 0.14));
+          box-shadow: 0 0 0 1px rgba(183, 67, 22, 0.07), 0 8px 20px rgba(183, 67, 22, 0.12);
+        }}
+        .brain3d-badge-dot {{
+          width: 8px;
+          height: 8px;
+          border-radius: 999px;
+          background: #c84f1c;
+          box-shadow: 0 0 0 0 rgba(200, 79, 28, 0.45);
+          animation: brain3d-pulse 1.6s infinite;
+        }}
+        .brain3d-meta {{
+          color: #665f57;
+          font-size: 13px;
+          line-height: 1.5;
+        }}
+        .brain3d-progress {{
+          width: 100%;
+          height: 8px;
+          border-radius: 999px;
+          background: rgba(23, 23, 23, 0.08);
+          overflow: hidden;
+          margin-bottom: 12px;
+        }}
+        .brain3d-progress-fill {{
+          height: 100%;
+          width: 0%;
+          border-radius: inherit;
+          background: linear-gradient(90deg, #ffbf80, #b74316);
+          transition: width 160ms linear;
+        }}
+        @keyframes brain3d-pulse {{
+          0% {{ box-shadow: 0 0 0 0 rgba(200, 79, 28, 0.45); }}
+          70% {{ box-shadow: 0 0 0 10px rgba(200, 79, 28, 0.0); }}
+          100% {{ box-shadow: 0 0 0 0 rgba(200, 79, 28, 0.0); }}
+        }}
+      </style>
+      <div class="brain3d-wrap">
+        <div class="brain3d-toolbar">
+          <div class="brain3d-controls">
+            <button id="brain3d-play" class="brain3d-btn">Play</button>
+            <button id="brain3d-pause" class="brain3d-btn">Pause</button>
+            <div id="brain3d-status" class="brain3d-badge">
+              <span class="brain3d-badge-dot"></span>
+              Auto-play active
+            </div>
+          </div>
+          <div id="brain3d-label" class="brain3d-meta"></div>
+        </div>
+        <div class="brain3d-progress">
+          <div id="brain3d-progress-fill" class="brain3d-progress-fill"></div>
+        </div>
+        <div id="brain3d-plot" style="width:100%; height:{height}px;"></div>
+        <div id="brain3d-summary" class="brain3d-meta"></div>
+      </div>
+      <script>{plotly_js}</script>
+      <script>
+        const payload = {payload_json};
+        const frames = payload.frames;
+        const plotDiv = document.getElementById("brain3d-plot");
+        const label = document.getElementById("brain3d-label");
+        const summary = document.getElementById("brain3d-summary");
+        const status = document.getElementById("brain3d-status");
+        const progressFill = document.getElementById("brain3d-progress-fill");
+        let currentIndex = 0;
+        let timer = null;
+        let orbitTick = 0;
+        let transitionToken = 0;
+        let displayedColors = frames[0].vertexcolor.map((color) => color.slice());
+
+        const trace = {{
+          type: "mesh3d",
+          x: payload.x,
+          y: payload.y,
+          z: payload.z,
+          i: payload.i,
+          j: payload.j,
+          k: payload.k,
+          vertexcolor: frames[0].vertexcolor,
+          flatshading: false,
+          hoverinfo: "skip",
+          showscale: false,
+          lighting: {{ambient: 0.68, diffuse: 0.34, specular: 0.03, roughness: 1.0, fresnel: 0.02}},
+          lightposition: {{x: -70, y: 10, z: 180}},
+        }};
+        const layout = {{
+          margin: {{l: 0, r: 0, b: 0, t: 0}},
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(0,0,0,0)",
+          scene: {{
+            bgcolor: "rgba(0,0,0,0)",
+            xaxis: {{visible: false}},
+            yaxis: {{visible: false}},
+            zaxis: {{visible: false}},
+            aspectmode: "data",
+            camera: {{eye: {{x: -1.55, y: 0.08, z: 0.82}}}},
+          }},
+          uirevision: "brain3d-fixed",
+        }};
+
+        function cameraEye(stepSeed) {{
+          const angle = -1.18 + stepSeed * 0.24;
+          const radius = 1.55;
+          return {{
+            x: -Math.cos(angle) * radius,
+            y: Math.sin(angle) * radius * 0.45,
+            z: 0.82 + 0.07 * Math.sin(angle * 0.55),
+          }};
+        }}
+
+        function setPlaying(isPlaying) {{
+          status.innerHTML = isPlaying
+            ? '<span class="brain3d-badge-dot"></span>Auto-play active'
+            : '<span class="brain3d-badge-dot"></span>Pause';
+          status.classList.toggle("brain3d-badge-live", isPlaying);
+        }}
+
+        function renderFrame(index) {{
+          currentIndex = ((index % frames.length) + frames.length) % frames.length;
+          const frame = frames[currentIndex];
+          orbitTick += 1;
+          const targetColors = frame.vertexcolor;
+          const startColors = displayedColors;
+          const totalSteps = Math.max(4, Math.min(8, Math.round(payload.transitionMs / 32)));
+          const token = ++transitionToken;
+          function tick(step) {{
+            if (token !== transitionToken) {{
+              return;
+            }}
+            const ratio = Math.min(1, step / totalSteps);
+            const eased = ratio < 0.5
+              ? 4 * ratio * ratio * ratio
+              : 1 - Math.pow(-2 * ratio + 2, 3) / 2;
+            const blended = startColors.map((color, vertexIndex) => {{
+              const target = targetColors[vertexIndex];
+              return [
+                Math.round(color[0] + (target[0] - color[0]) * eased),
+                Math.round(color[1] + (target[1] - color[1]) * eased),
+                Math.round(color[2] + (target[2] - color[2]) * eased),
+              ];
+            }});
+            Plotly.restyle(plotDiv, {{vertexcolor: [blended]}}, [0]);
+            if (step < totalSteps) {{
+              window.setTimeout(() => tick(step + 1), Math.max(16, Math.round(payload.transitionMs / totalSteps)));
+              return;
+            }}
+            displayedColors = targetColors.map((color) => color.slice());
+          }}
+          tick(1);
+          Plotly.relayout(plotDiv, {{"scene.camera.eye": cameraEye(orbitTick)}});
+          label.textContent = `Timestep ${{frame.index + 1}} / ${{frames.length}} | ${{Number(frame.start).toFixed(2)}}s`;
+          progressFill.style.width = `${{((currentIndex + 1) / Math.max(frames.length, 1)) * 100}}%`;
+          const parts = [frame.summary, `Likely zone: ${{frame.zone}}`, `Valence: ${{frame.valence}}`];
+          if (frame.text) {{
+            parts.push(`Text: ${{frame.text}}`);
+          }}
+          summary.textContent = parts.join(" | ");
+        }}
+
+        function play() {{
+          if (timer !== null) return;
+          setPlaying(true);
+          timer = window.setInterval(() => renderFrame(currentIndex + 1), payload.frameDurationMs);
+        }}
+
+        function pause() {{
+          if (timer !== null) {{
+            window.clearInterval(timer);
+            timer = null;
+          }}
+          setPlaying(false);
+        }}
+
+        document.getElementById("brain3d-play").addEventListener("click", play);
+        document.getElementById("brain3d-pause").addEventListener("click", pause);
+        Plotly.newPlot(plotDiv, [trace], layout, {{
+          displayModeBar: true,
+          responsive: true,
+          scrollZoom: true,
+        }}).then(() => {{
+          renderFrame(0);
+          play();
+        }});
+      </script>
+    </div>
+    """
+
+
+def export_prediction_video(
+    run: PredictionRun,
+    *,
+    output_folder: str | Path,
+    max_timesteps: int | None = None,
+    mesh: str = "fsaverage5",
+    interpolated_fps: int | None = 12,
+    cmap: str = "fire",
+    norm_percentile: int = 99,
+    vmin: float | None = 0.5,
+) -> Path:
+    """Render a brain prediction animation to MP4."""
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    n_timesteps = len(run.preds) if max_timesteps is None else min(len(run.preds), max_timesteps)
+    fps_tag = interpolated_fps or 1
+    output_path = output_folder / f"tribev2_prediction_{n_timesteps:03d}t_{fps_tag:02d}fps.mp4"
+    plotter = get_pyvista_plotter(mesh)
+    plotter.plot_timesteps_mp4(
+        run.preds[:n_timesteps],
+        filepath=output_path,
+        segments=run.segments[:n_timesteps],
+        interpolated_fps=interpolated_fps,
+        cmap=cmap,
+        norm_percentile=norm_percentile,
+        vmin=vmin,
+    )
+    return output_path
+
+
+def describe_timestep(
+    preds: np.ndarray,
+    *,
+    timestep: int,
+    mesh: str = "fsaverage5",
+    top_percent: float = 1.0,
+) -> dict[str, tp.Any]:
+    """Summarize where the strongest predicted activity sits on the cortex."""
+    if timestep < 0 or timestep >= len(preds):
+        raise IndexError(f"Invalid timestep {timestep} for predictions of length {len(preds)}.")
+    if not 0 < top_percent <= 100:
+        raise ValueError("top_percent must be within (0, 100].")
+
+    signal = np.asarray(preds[timestep], dtype=float)
+    abs_signal = np.abs(signal)
+    n_vertices = len(abs_signal)
+    k = max(32, int(np.ceil(n_vertices * top_percent / 100)))
+    idx = np.argpartition(abs_signal, -k)[-k:]
+    plotter = get_pyvista_plotter(mesh)
+    coords = plotter._mesh["both"]["coords"]
+    focus_coords = coords[idx]
+    weights = abs_signal[idx]
+    if float(weights.sum()) <= 1e-12:
+        weighted_center = focus_coords.mean(axis=0)
+    else:
+        weighted_center = np.average(focus_coords, axis=0, weights=weights)
+    coord_scale = np.maximum(np.max(np.abs(coords), axis=0), 1e-6)
+    x_score, y_score, z_score = weighted_center / coord_scale
+
+    def classify_axis(
+        score: float,
+        negative: str,
+        neutral: str,
+        positive: str,
+        threshold: float = 0.12,
+    ) -> str:
+        if score <= -threshold:
+            return negative
+        if score >= threshold:
+            return positive
+        return neutral
+
+    laterality = classify_axis(
+        x_score,
+        negative="left",
+        neutral="bilateral",
+        positive="right",
+    )
+    antero_posterior = classify_axis(
+        y_score,
+        negative="posterior",
+        neutral="central",
+        positive="anterior",
+    )
+    dorso_ventral = classify_axis(
+        z_score,
+        negative="ventral",
+        neutral="intermediate",
+        positive="dorsal",
+    )
+    focus_share = float(weights.sum() / max(abs_signal.sum(), 1e-8))
+    mean_abs = float(abs_signal.mean())
+    peak_abs = float(abs_signal.max())
+    summary = (
+        f"The most salient vertices are mainly {laterality}, "
+        f"leaning {antero_posterior} and {dorso_ventral}. "
+        f"The top {top_percent:.1f}% of vertices concentrate {focus_share:.1%} "
+        f"of the absolute amplitude at this timestep."
+    )
+    return {
+        "laterality": laterality,
+        "antero_posterior": antero_posterior,
+        "dorso_ventral": dorso_ventral,
+        "focus_share": focus_share,
+        "mean_abs": mean_abs,
+        "peak_abs": peak_abs,
+        "summary": summary,
+    }
+
+
+def collect_timestep_metadata(run: PredictionRun) -> list[dict[str, tp.Any]]:
+    """Collect lightweight timing/text metadata for synced playback."""
+    out: list[dict[str, tp.Any]] = []
+    for idx in range(len(run.preds)):
+        segment = run.segments[idx] if idx < len(run.segments) else None
+        start = getattr(segment, "start", None)
+        duration = getattr(segment, "duration", None)
+        if start is None:
+            start = float(idx)
+        if duration is None:
+            if idx + 1 < len(run.segments):
+                next_start = getattr(run.segments[idx + 1], "start", None)
+                duration = (float(next_start) - float(start)) if next_start is not None else 1.0
+            else:
+                duration = 1.0
+        duration = max(float(duration), 1e-3)
+        out.append(
+            {
+                "index": idx,
+                "start": float(start),
+                "duration": duration,
+                "text": get_segment_text(segment) if segment is not None else "",
+            }
+        )
+    return out
+
+
+def get_segment_text(segment: tp.Any) -> str:
+    """Best-effort text extraction that tolerates lightweight fake segments in tests."""
+    if segment is None:
+        return ""
+    try:
+        return get_text(segment)
+    except Exception:
+        return ""
+
+
+def build_explainability_report(
+    run: PredictionRun,
+    *,
+    timestep: int,
+    duration: float | None = None,
+    description: dict[str, tp.Any] | None = None,
+) -> dict[str, tp.Any]:
+    """Build a source-backed explanation for one run and timestep."""
+    description = description or describe_timestep(run.preds, timestep=timestep)
+    channels = list_run_channels(run)
+    channel_text = ", ".join(channels)
+    shared_section = {
+        "title": "What TRIBE v2 is doing here",
+        "bullets": [
+            "The paper and Meta write-up present TRIBE v2 as a tri-modal vision/audio/language model that predicts cortical responses, not decoded thoughts or diagnoses.",
+            "The publication reports more than 1,000 hours of fMRI from 720 subjects; the blog mentions more than 700 healthy volunteers and highlights roughly 70x finer resolution than earlier comparable models.",
+            f"For this input, the pipeline mainly uses: {channel_text}.",
+        ],
+    }
+    reading_bullets = [
+        "The surface shown is `fsaverage5`, so this is a shared reference cortex, not an individual brain.",
+        "Warmer colors indicate a stronger predicted response at this timestep.",
+        description["summary"],
+    ]
+    if duration is not None:
+        reading_bullets.append(
+            f"Timestep {timestep} covers about {duration:.2f}s of the prepared stimulus."
+        )
+    reading_section = {
+        "title": "How to read this map",
+        "bullets": reading_bullets,
+    }
+
+    if run.input_kind == "video":
+        modality_section = {
+            "title": "Why this video is interpretable",
+            "bullets": [
+                "The official notebook breaks a video into time-aligned visual, audio, and text cues, then the model predicts a cortical map roughly once per second.",
+                "The notebook uses separate extractors for vision, audio, and text, then fuses them with a shared Transformer before cortical prediction.",
+                "For video, map changes often reflect a mix of scene changes, sound variation, and verbal content at the same timestep.",
+            ],
+        }
+        limits_section = {
+            "title": "Limits",
+            "bullets": [
+                "This map estimates a plausible average response according to the model, not measured activity from a real subject.",
+                "A hotter zone does not imply one unique cognitive interpretation by itself; several sensory cues may contribute at once.",
+            ],
+        }
+    elif run.input_kind == "audio":
+        has_text_alignment = "aligned text" in channels
+        modality_section = {
+            "title": "Why this audio is interpretable",
+            "bullets": [
+                "TRIBE v2 explicitly includes audition among its three modalities; for audio input, the map mainly reflects sound structure and, when available, aligned words.",
+                (
+                    "This run also includes an aligned text channel, so words can help explain some temporal variations."
+                    if has_text_alignment
+                    else "This run works without mandatory transcription, so prediction depends mainly on acoustic content."
+                ),
+                "The most useful reading is to connect each temporal peak to a change in rhythm, intonation, timbre, or speech.",
+            ],
+        }
+        limits_section = {
+            "title": "Limits",
+            "bullets": [
+                "Without aligned transcription, the explanation stays mostly acoustic and less semantic.",
+                "The model simulates a probable cortical response; it does not definitively localize a human brain function.",
+            ],
+        }
+    elif run.input_kind == "text":
+        direct_text = run.raw_text is not None and "aligned text" in channels and "audio" not in channels
+        modality_section = {
+            "title": "Why this text is interpretable",
+            "bullets": [
+                "The official notebook indicates that the text branch goes through the model's language encoder and emits predictions on the cortex along an aligned timeline.",
+                (
+                    "In the official notebook, text is converted to speech and transcribed back to recover word timings, because the model was trained on naturalistic audio/video stimuli."
+                    if not direct_text
+                    else "In this fork, `Direct text` creates synthetic word timings to make local use simpler; it is a practical shortcut, distinct from the notebook's exact workflow."
+                ),
+                "When reading the map, connect signal changes to new words arriving, context density, and sentence boundaries.",
+            ],
+        }
+        limits_section = {
+            "title": "Limits",
+            "bullets": [
+                "In direct text mode, timings are artificial: they drive the model locally, not reproduce a real experimental presentation.",
+                "The map remains a plausible predicted brain response to the text, not proof that one region exclusively encodes that semantic content.",
+            ],
+        }
+    else:
+        modality_section = {
+            "title": "Why this image is interpretable",
+            "bullets": [
+                "The Meta write-up emphasizes the model's ability to predict responses to what the brain sees; this branch of the fork therefore reuses the model's visual pathway.",
+                "Technically, a static image is converted here into a short silent video clip so it can flow through the project pipeline without changing the model weights.",
+                "If the map stays stable across several timesteps, that mostly means fixed visual content dominates; the remaining small variations come from temporal windowing in the pipeline, not from a new scene.",
+            ],
+        }
+        limits_section = {
+            "title": "Limits",
+            "bullets": [
+                "Static image support is an addition from this fork; it is not the main protocol highlighted in the official notebook.",
+                "Because the image is repeated over time, temporal differences should be interpreted cautiously and the overall spatial pattern should carry most of the weight.",
+            ],
+        }
+
+    return {
+        "title": f"{run.input_kind.title()} explanation",
+        "sections": [shared_section, modality_section, reading_section, limits_section],
+        "sources": EXPLAINABILITY_SOURCES,
+    }
+
+
+def build_image_comparison_guide(
+    run: ImageComparisonRun,
+    *,
+    timestep: int,
+    descriptions: list[dict[str, tp.Any]] | None = None,
+) -> dict[str, tp.Any]:
+    """Explain how to compare two static-image predictions."""
+    descriptions = descriptions or [
+        describe_timestep(item.preds, timestep=timestep) for item in run.runs
+    ]
+    bullets = [
+        "Both images go through the same visual pipeline and the same cortical mesh, so the comparison is mainly spatial.",
+        "Compare laterality, the anterior-posterior axis, the dorsal-ventral axis, and the concentration of the top 1% of the signal first.",
+        "Because each image is converted into a silent static clip in this fork, differences between columns come from visual content, not from sound or scene changes.",
+    ]
+    if len(descriptions) >= 2:
+        left = descriptions[0]
+        right = descriptions[1]
+        bullets.append(
+            "At the observed timestep, image 1 is mostly "
+            f"{left['laterality']}, {left['antero_posterior']}, and {left['dorso_ventral']}; "
+            "while image 2 is mostly "
+            f"{right['laterality']}, {right['antero_posterior']}, and {right['dorso_ventral']}."
+        )
+    return {
+        "title": "How to compare these images",
+        "bullets": bullets,
+        "sources": EXPLAINABILITY_SOURCES,
+    }
+
+
+def segment_preview(run: PredictionRun, timestep: int) -> dict[str, tp.Any]:
+    """Extract lightweight preview data for one segment."""
+    segment = run.segments[timestep]
+    preview: dict[str, tp.Any] = {
+        "start": getattr(segment, "start", None),
+        "duration": getattr(segment, "duration", None),
+        "text": get_text(segment),
+        "frame": None,
+    }
+    clip = get_clip(segment)
+    if clip is not None:
+        try:
+            sample_time = min(max(clip.duration / 2, 0), max(clip.duration - 1e-3, 0))
+            preview["frame"] = clip.get_frame(sample_time)
+        finally:
+            clip.close()
+    return preview
+
+
+def resolve_ffmpeg() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    env_ffmpeg = Path(sys.executable).parent / "Library" / "bin" / "ffmpeg.exe"
+    if env_ffmpeg.exists():
+        return str(env_ffmpeg)
+    raise FileNotFoundError("ffmpeg executable not found")
+
+
+def resolve_video_encoder(ffmpeg_bin: str | None = None) -> str:
+    ffmpeg_bin = ffmpeg_bin or resolve_ffmpeg()
+    result = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    available = result.stdout + result.stderr
+    for encoder in ("libx264", "libopenh264", "mpeg4"):
+        if encoder in available:
+            return encoder
+    raise RuntimeError("No supported MP4 video encoder found in ffmpeg.")
+
+
+def build_video_from_image(
+    *,
+    image_path: str | Path,
+    output_folder: str | Path,
+    duration: float = 4.0,
+    fps: int = 6,
+) -> Path:
+    image_path = Path(image_path)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    if duration <= 0:
+        raise ValueError("Image clip duration must be strictly positive.")
+    if fps < 1:
+        raise ValueError("Image clip fps must be at least 1.")
+
+    ffmpeg_bin = resolve_ffmpeg()
+    video_encoder = resolve_video_encoder(ffmpeg_bin)
+    safe_stem = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in image_path.stem)
+    output_path = output_folder / f"{safe_stem}_{duration:.2f}s_{fps}fps.mp4"
+    if output_path.exists():
+        return output_path
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        str(fps),
+        "-i",
+        str(image_path),
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=mono:sample_rate=16000",
+        "-t",
+        f"{duration:.3f}",
+        "-shortest",
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "-c:v",
+        video_encoder,
+    ]
+    if video_encoder == "libx264":
+        cmd.extend(["-crf", "18"])
+    elif video_encoder == "libopenh264":
+        cmd.extend(["-b:v", "4M"])
+    else:
+        cmd.extend(["-q:v", "3"])
+    cmd.extend(
+        [
+            "-c:a",
+            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+    )
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return output_path
+
+
+def build_browser_media_proxy(
+    *,
+    source_path: str | Path,
+    output_folder: str | Path,
+) -> Path:
+    """Transcode source media to a browser-friendly proxy for app playback."""
+    source_path = Path(source_path)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    suffix = source_path.suffix.lower()
+    stat = source_path.stat()
+    safe_stem = "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in source_path.stem)
+    fingerprint = f"{stat.st_size}_{stat.st_mtime_ns}"
+    ffmpeg_bin = resolve_ffmpeg()
+
+    if suffix in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}:
+        video_encoder = resolve_video_encoder(ffmpeg_bin)
+        output_path = output_folder / f"{safe_stem}_{fingerprint}_sync.mp4"
+        if output_path.exists():
+            return output_path
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-c:v",
+            video_encoder,
+        ]
+        if video_encoder == "libx264":
+            cmd.extend(["-crf", "20"])
+        elif video_encoder == "libopenh264":
+            cmd.extend(["-b:v", "4M"])
+        else:
+            cmd.extend(["-q:v", "3"])
+        cmd.extend(
+            [
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return output_path
+
+    if suffix in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}:
+        output_path = output_folder / f"{safe_stem}_{fingerprint}_sync.wav"
+        if output_path.exists():
+            return output_path
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return output_path
+
+    return source_path
+
+
+def write_text_to_temp_file(text: str, folder: str | Path) -> Path:
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="tribev2_text_", suffix=".txt", dir=folder)
+    os.close(fd)
+    path = Path(temp_path)
+    path.write_text(text, encoding="utf-8")
+    return path
