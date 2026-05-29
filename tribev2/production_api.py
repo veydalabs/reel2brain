@@ -18,7 +18,7 @@ import uuid
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 from pydantic import BaseModel
@@ -34,6 +34,7 @@ from tribev2.easy import (
     DEFAULT_TEXT_MODEL,
     ImageComparisonRun,
     PredictionRun,
+    _smooth_surface_values,
     _get_surface_render_data,
     build_display_reference_signal,
     build_emotion_hypothesis_frame,
@@ -44,6 +45,7 @@ from tribev2.easy import (
     collect_timestep_metadata,
     get_pyvista_plotter,
     load_model,
+    normalize_signal_for_display,
     predict_from_prepared_events,
     prepare_events,
     render_run_panel_bytes,
@@ -313,15 +315,33 @@ def get_cached_brain_frames_payload(
 ) -> dict[str, tp.Any]:
     artifact_path = get_saved_run_artifact_path(cache_folder, run_id, "brain_frames.json")
     if artifact_path.exists():
-        return tp.cast(dict[str, tp.Any], json.loads(artifact_path.read_text(encoding="utf-8")))
+        cached_payload = tp.cast(dict[str, tp.Any], json.loads(artifact_path.read_text(encoding="utf-8")))
+        frames = tp.cast(list[dict[str, tp.Any]], cached_payload.get("frames", []))
+        if frames and all("activation_b64" in frame for frame in frames):
+            return cached_payload
 
     display_reference = build_display_reference_signal(run)
     timing = collect_timestep_metadata(run)
     summary = summarize_predictions(run.preds)
+    plotter = get_pyvista_plotter(mesh)
+    mesh_data = plotter._mesh["both"]
     frames: list[dict[str, tp.Any]] = []
     for timestep in range(len(run.preds)):
         meta = timing[timestep] if timestep < len(timing) else {}
         summary_row = summary.iloc[timestep] if timestep < len(summary) else None
+        normalized_signal = normalize_signal_for_display(
+            run.preds[timestep],
+            percentile=99,
+            reference_signal=display_reference,
+        )
+        activation = plotter.get_stat_map(normalized_signal)["both"]
+        activation = _smooth_surface_values(
+            activation,
+            mesh=mesh,
+            passes=2,
+            blend=0.34,
+        )
+        activation = np.clip(activation, 0.0, 1.0)
         _, _, _, colors = _get_surface_render_data(
             run.preds[timestep],
             mesh=mesh,
@@ -333,6 +353,7 @@ def get_cached_brain_frames_payload(
             surface_smoothing_blend=0.34,
         )
         color_bytes = np.round(colors * 255).astype(np.uint8).tobytes()
+        activation_bytes = np.round(activation * 255).astype(np.uint8).tobytes()
         frames.append(
             {
                 "timestep": timestep,
@@ -341,13 +362,14 @@ def get_cached_brain_frames_payload(
                 "text": str(meta.get("text", "") or ""),
                 "mean_abs": round(float(summary_row["mean_abs"]), 6) if summary_row is not None else 0.0,
                 "colors_b64": base64.b64encode(color_bytes).decode("ascii"),
+                "activation_b64": base64.b64encode(activation_bytes).decode("ascii"),
                 "panel_url": f"/api/runs/{run_id}/panels/{timestep}.jpg",
             }
         )
 
     payload = {
         "mesh": mesh,
-        "vertex_count": int(run.preds.shape[1]),
+        "vertex_count": int(mesh_data["coords"].shape[0]),
         "frames": frames,
     }
     artifact_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -664,7 +686,15 @@ def create_app() -> FastAPI:
     async def get_brain_frames(run_id: str, request: Request, mesh: str = "fsaverage5") -> dict[str, tp.Any]:
         cache = tp.cast(Path, request.app.state.cache_folder)
         run = load_prediction_run(cache, run_id)
-        return get_cached_brain_frames_payload(cache, run_id, run, mesh=mesh)
+        payload = get_cached_brain_frames_payload(cache, run_id, run, mesh=mesh)
+        return JSONResponse(
+            content=payload,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
     @app.post("/api/runs/{run_id}/analysis")
     async def analyze_run(run_id: str, body: AnalysisRequest, request: Request) -> dict[str, tp.Any]:

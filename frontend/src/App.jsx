@@ -188,7 +188,14 @@ function MetricCard({ label, value, accent }) {
   )
 }
 
-function TimelineScroller({ timeline, selectedTimestep, onSelect, className = '' }) {
+function TimelineScroller({
+  timeline,
+  selectedTimestep,
+  onSelect,
+  isPlaying = false,
+  onTogglePlay = null,
+  className = '',
+}) {
   if (!timeline.length) {
     return null
   }
@@ -197,13 +204,20 @@ function TimelineScroller({ timeline, selectedTimestep, onSelect, className = ''
 
   return (
     <div className={`timeline-card ${className}`.trim()}>
-      <input
-        type="range"
-        min="0"
-        max={Math.max(0, timeline.length - 1)}
-        value={selectedTimestep}
-        onChange={(event) => onSelect(Number(event.target.value))}
-      />
+      <div className="timeline-card__controls">
+        {onTogglePlay ? (
+          <button type="button" className="button timeline-card__button" onClick={onTogglePlay}>
+            {isPlaying ? 'Pause' : 'Play'}
+          </button>
+        ) : null}
+        <input
+          type="range"
+          min="0"
+          max={Math.max(0, timeline.length - 1)}
+          value={selectedTimestep}
+          onChange={(event) => onSelect(Number(event.target.value))}
+        />
+      </div>
       <div className="timeline-card__meta">
         <strong>{activeStep?.text || 'No aligned transcript for this timestep.'}</strong>
         <span>
@@ -931,13 +945,6 @@ function App() {
                     <h2>Video and cortical panels</h2>
                   </div>
                   <div className="transport">
-                    <button
-                      type="button"
-                      className="button"
-                      onClick={() => setIsPlaying((current) => !current)}
-                    >
-                      {isPlaying ? 'Pause' : 'Play'}
-                    </button>
                     <span>
                       t{selectedTimestep} · {formatSeconds(timeline[selectedTimestep]?.start_s ?? 0)}
                     </span>
@@ -950,6 +957,7 @@ function App() {
                         ref={videoRef}
                         src={runDetail.source_url}
                         controls
+                        loop
                         className="review-video__player"
                         onTimeUpdate={handleVideoTimeUpdate}
                         onPlay={() => setIsPlaying(true)}
@@ -962,6 +970,8 @@ function App() {
                       timeline={timeline}
                       selectedTimestep={selectedTimestep}
                       onSelect={setSelectedTimestep}
+                      isPlaying={isPlaying}
+                      onTogglePlay={() => setIsPlaying((current) => !current)}
                     />
                   </div>
                   <div className="review-panel">
@@ -998,6 +1008,8 @@ function App() {
                       timeline={timeline}
                       selectedTimestep={selectedTimestep}
                       onSelect={setSelectedTimestep}
+                      isPlaying={isPlaying}
+                      onTogglePlay={() => setIsPlaying((current) => !current)}
                       className="timeline-card--brain-linked"
                     />
                   </div>

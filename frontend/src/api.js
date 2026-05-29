@@ -51,7 +51,11 @@ export async function fetchBrainMesh() {
 }
 
 export async function fetchBrainFrames(runId) {
-  return readJson(await fetch(`/api/runs/${runId}/brain/frames`))
+  return readJson(
+    await fetch(`/api/runs/${runId}/brain/frames?ts=${Date.now()}`, {
+      cache: 'no-store',
+    }),
+  )
 }
 
 export async function analyzeRun(runId, payload) {

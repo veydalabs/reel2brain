@@ -508,6 +508,17 @@ textarea:focus {
   min-width: 0;
 }
 
+.timeline-card__controls {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.timeline-card__button {
+  min-width: 88px;
+}
+
 .timeline-card--brain-linked {
   margin-top: 0;
 }
@@ -616,6 +627,7 @@ input[type='range'] {
 }
 
 .brain-stage__canvas {
+  position: relative;
   min-height: 620px;
   overflow: hidden;
   border: 1px solid rgba(52, 72, 82, 0.92);
@@ -627,8 +639,39 @@ input[type='range'] {
   box-shadow: inset 0 0 80px rgba(0, 0, 0, 0.44);
 }
 
-.brain-stage__canvas canvas {
+.brain-viewer {
+  position: relative;
+  min-height: 620px;
+  height: 100%;
+}
+
+.brain-viewer__canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 620px;
+}
+
+.brain-stage__canvas canvas,
+.brain-viewer__canvas canvas {
   display: block;
+}
+
+.brain-viewer__toolbar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 2;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.brain-viewer__button {
+  min-width: 74px;
+  padding: 8px 12px;
+  background: rgba(6, 12, 17, 0.84);
+  border-color: rgba(95, 123, 142, 0.42);
+  backdrop-filter: blur(10px);
 }
 
 .brain-stage__loading {
@@ -789,7 +832,9 @@ textarea {
   }
 
   .brain-stage__canvas,
-  .brain-stage__loading {
+  .brain-stage__loading,
+  .brain-viewer,
+  .brain-viewer__canvas {
     min-height: 420px;
   }
 }
