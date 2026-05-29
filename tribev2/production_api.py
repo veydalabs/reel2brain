@@ -36,12 +36,14 @@ from tribev2.easy import (
     PredictionRun,
     _smooth_surface_values,
     _get_surface_render_data,
+    ZONE_FAMILY_META,
     build_display_reference_signal,
     build_emotion_hypothesis_frame,
     build_run_roi_frame,
     build_run_zone_frame,
     build_timestep_report_frame,
     build_timestep_zone_frame,
+    classify_roi_family,
     collect_timestep_metadata,
     get_pyvista_plotter,
     load_model,
@@ -53,6 +55,7 @@ from tribev2.easy import (
 )
 from tribev2.openai_chat import DEFAULT_OPENAI_CHAT_MODEL, request_openai_run_explanation
 from tribev2.runtime import apply_warning_filters
+from tribev2.utils import get_hcp_vertex_labels
 
 
 LOGGER = logging.getLogger("tribev2.production_api")
@@ -223,19 +226,26 @@ def build_zone_series_payload(run: PredictionRun) -> list[dict[str, tp.Any]]:
     if run_zone_frame.empty or timestep_zone_frame.empty:
         return []
     pivot = (
-        timestep_zone_frame.pivot(index="timestep", columns="zone", values="share")
+        timestep_zone_frame.pivot(index="timestep", columns="zone_key", values="share")
         .fillna(0.0)
         .sort_index()
     )
-    ordered_columns = [zone for zone in run_zone_frame["zone"].tolist() if zone in pivot.columns]
+    ordered_columns = [
+        zone_key for zone_key in run_zone_frame["zone_key"].tolist() if zone_key in pivot.columns
+    ]
     if ordered_columns:
         pivot = pivot.reindex(columns=ordered_columns)
+    labels_by_key = {
+        str(row["zone_key"]): str(row["zone"])
+        for row in run_zone_frame[["zone_key", "zone"]].to_dict(orient="records")
+    }
     series: list[dict[str, tp.Any]] = []
-    for zone in pivot.columns:
-        values = [round(float(value), 6) for value in pivot[zone].astype(float).tolist()]
+    for zone_key in pivot.columns:
+        values = [round(float(value), 6) for value in pivot[zone_key].astype(float).tolist()]
         series.append(
             {
-                "zone": str(zone),
+                "zone_key": str(zone_key),
+                "zone": labels_by_key.get(str(zone_key), str(zone_key)),
                 "values": values,
                 "peak": round(max(values) if values else 0.0, 6),
             }
@@ -280,13 +290,39 @@ def build_run_entry(entry: dict[str, tp.Any]) -> dict[str, tp.Any]:
     }
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def get_mesh_payload(mesh: str = "fsaverage5") -> dict[str, tp.Any]:
     plotter = get_pyvista_plotter(mesh)
     mesh_data = plotter._mesh["both"]
     coords = np.round(np.asarray(mesh_data["coords"], dtype=float), 3).tolist()
     faces = np.asarray(mesh_data["faces"], dtype=int).tolist()
-    return {"mesh": mesh, "coords": coords, "faces": faces}
+    bg_map = np.asarray(mesh_data["bg_map"], dtype=float)
+    bg_norm = (bg_map - bg_map.min()) / (bg_map.max() - bg_map.min() + 1e-8)
+    bg_bytes = np.round(np.clip(bg_norm, 0.0, 1.0) * 255).astype(np.uint8)
+
+    zone_keys = list(ZONE_FAMILY_META.keys())
+    zone_index_by_key = {zone_key: index for index, zone_key in enumerate(zone_keys)}
+    vertex_zone_labels = get_hcp_vertex_labels(mesh=mesh, combine=False)
+    zone_indices = [
+        zone_index_by_key.get(
+            classify_roi_family(vertex_label) if vertex_label else "association_other",
+            zone_index_by_key["association_other"],
+        )
+        for vertex_label in vertex_zone_labels
+    ]
+
+    return {
+        "mesh": mesh,
+        "coords": coords,
+        "faces": faces,
+        "bg_b64": base64.b64encode(bg_bytes.tobytes()).decode("ascii"),
+        "zone_keys": zone_keys,
+        "zone_labels": {
+            zone_key: str(zone_meta["label"])
+            for zone_key, zone_meta in ZONE_FAMILY_META.items()
+        },
+        "zone_indices": zone_indices,
+    }
 
 
 @lru_cache(maxsize=4)

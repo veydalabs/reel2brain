@@ -10,23 +10,13 @@ import {
   fetchRunDetail,
   fetchRuns,
 } from './api'
+import { getZoneColor } from './zonePalette'
 
 const ThreeBrainViewer = lazy(() =>
   import('./components/ThreeBrainViewer').then((module) => ({
     default: module.ThreeBrainViewer,
   })),
 )
-
-const ZONE_COLORS = [
-  '#6ee7f9',
-  '#22c55e',
-  '#f97316',
-  '#facc15',
-  '#a78bfa',
-  '#fb7185',
-  '#38bdf8',
-  '#e5e7eb',
-]
 
 const DEFAULT_UPLOAD_SETTINGS = {
   checkpoint: 'facebook/tribev2',
@@ -152,12 +142,12 @@ function ZoneChart({ series, selectedTimestep, onSelect }) {
           y2={height - padding.bottom}
           className="zone-chart__guide"
         />
-        {series.map((entry, index) => (
+        {series.map((entry) => (
           <path
-            key={entry.zone}
+            key={entry.zone_key ?? entry.zone}
             d={buildLinePath(entry.values, width, height, padding, maxValue)}
             fill="none"
-            stroke={ZONE_COLORS[index % ZONE_COLORS.length]}
+            stroke={getZoneColor(entry.zone_key)}
             strokeWidth="3"
             strokeLinecap="round"
             className="zone-chart__line"
@@ -165,11 +155,11 @@ function ZoneChart({ series, selectedTimestep, onSelect }) {
         ))}
       </svg>
       <div className="zone-chart__legend">
-        {series.map((entry, index) => (
-          <div key={entry.zone} className="zone-chart__legend-item">
+        {series.map((entry) => (
+          <div key={entry.zone_key ?? entry.zone} className="zone-chart__legend-item">
             <span
               className="zone-chart__swatch"
-              style={{ background: ZONE_COLORS[index % ZONE_COLORS.length] }}
+              style={{ background: getZoneColor(entry.zone_key) }}
             />
             <span>{entry.zone}</span>
           </div>
@@ -1052,11 +1042,11 @@ function App() {
                   </div>
                 </div>
                 <div className="zone-summary">
-                  {(runDetail.dominant_zones ?? []).map((zone, index) => (
-                    <article key={zone.zone} className="zone-summary__card">
+                  {(runDetail.dominant_zones ?? []).map((zone) => (
+                    <article key={zone.zone_key ?? zone.zone} className="zone-summary__card">
                       <div
                         className="zone-summary__accent"
-                        style={{ background: ZONE_COLORS[index % ZONE_COLORS.length] }}
+                        style={{ background: getZoneColor(zone.zone_key) }}
                       />
                       <div>
                         <strong>{zone.zone}</strong>
