@@ -38,6 +38,13 @@ const DEFAULT_ANALYSIS_SETTINGS = {
 }
 
 const EMPTY_TIMELINE = []
+const ACTIVATION_GRADIENT =
+  'linear-gradient(to top, #000004 0%, #1b0c41 12%, #4a0c6b 25%, #781c6d 38%, #a52c60 50%, #cf4446 62%, #ed6925 74%, #fb9b06 86%, #fcfdbf 100%)'
+const BRAIN_OVERLAY_OPTIONS = [
+  { value: 'hcp', label: 'HCP-MMP boundaries' },
+  { value: 'systems', label: 'Broad systems' },
+  { value: 'none', label: 'None' },
+]
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max)
@@ -174,6 +181,77 @@ function MetricCard({ label, value, accent }) {
     <div className="metric-card">
       <span>{label}</span>
       <strong style={accent ? { color: accent } : undefined}>{value}</strong>
+    </div>
+  )
+}
+
+function ActivationScaleCard({ displayMeta }) {
+  const range = displayMeta?.activation_range ?? [0, 1]
+  const units = displayMeta?.activation_units ?? 'normalized activation'
+  const normalization = displayMeta?.normalization ?? 'shared_percentile_99_reference'
+
+  return (
+    <div className="brain-display-card">
+      <span className="brain-display-card__label">Activation Scale</span>
+      <div className="brain-scale">
+        <div className="brain-scale__bar" style={{ background: ACTIVATION_GRADIENT }} />
+        <div className="brain-scale__ticks">
+          <strong>{Number(range[1] ?? 1).toFixed(1)}</strong>
+          <span>{units}</span>
+          <strong>{Number(range[0] ?? 0).toFixed(1)}</strong>
+        </div>
+      </div>
+      <p className="brain-display-card__note">
+        Quantitative color only. Normalization: <code>{normalization}</code>. During playback,
+        the 3D view interpolates between adjacent timesteps for continuity, and the translucent
+        spread is a presentation layer rather than extra signal.
+      </p>
+    </div>
+  )
+}
+
+function BrainOverlayCard({ overlayMode, onOverlayChange, mesh, displayMeta }) {
+  return (
+    <div className="brain-display-card">
+      <span className="brain-display-card__label">Overlay</span>
+      <label className="brain-overlay__control">
+        <span>Guide layer</span>
+        <select value={overlayMode} onChange={(event) => onOverlayChange(event.target.value)}>
+          {BRAIN_OVERLAY_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {overlayMode === 'hcp' ? (
+        <p className="brain-display-card__note">
+          Thin parcel boundaries from the HCP-MMP atlas. Overlay does not alter activation values.
+        </p>
+      ) : null}
+      {overlayMode === 'systems' ? (
+        <>
+          <p className="brain-display-card__note">
+            Broad cortical systems are pedagogical guides, not canonical network labels.
+          </p>
+          <div className="brain-overlay__legend">
+            {(mesh?.zone_keys ?? []).map((zoneKey) => (
+              <div key={zoneKey} className="brain-overlay__legend-item">
+                <span
+                  className="brain-overlay__swatch"
+                  style={{ background: getZoneColor(zoneKey) }}
+                />
+                <span>{mesh?.zone_labels?.[zoneKey] ?? zoneKey}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
+      {overlayMode === 'none' ? (
+        <p className="brain-display-card__note">
+          {displayMeta?.overlay_note ?? 'No categorical guide overlay is active.'}
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -415,6 +493,7 @@ function App() {
   const [activeJob, setActiveJob] = useState(null)
   const [selectedTimestep, setSelectedTimestep] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
+  const [brainOverlayMode, setBrainOverlayMode] = useState('hcp')
   const [busy, setBusy] = useState(false)
   const [loadingRun, setLoadingRun] = useState(false)
   const [error, setError] = useState('')
@@ -431,6 +510,7 @@ function App() {
   const syncGuardRef = useRef(0)
   const meshRef = useRef(null)
   const uploadPreviewUrlRef = useRef('')
+  const playbackStateRef = useRef({ time: 0, isPlaying: false })
   const activeJobId = activeJob?.id ?? null
 
   const activeFrame = brainFrames?.frames?.[selectedTimestep] ?? null
@@ -550,6 +630,7 @@ function App() {
           }
           setSelectedTimestep(0)
           setIsPlaying(false)
+          playbackStateRef.current = { time: 0, isPlaying: false }
           setChatMessages([])
           setChatPrompt('')
           setResponseId(null)
@@ -599,9 +680,27 @@ function App() {
       return
     }
     if (isPlaying) {
+      playbackStateRef.current.isPlaying = true
       video.play().catch(() => {})
     } else {
+      playbackStateRef.current.isPlaying = false
       video.pause()
+    }
+  }, [isPlaying, runDetail?.source_url])
+
+  useEffect(() => {
+    if (!isPlaying) {
+      return undefined
+    }
+    let frameId = 0
+    const tick = () => {
+      playbackStateRef.current.time =
+        videoRef.current?.currentTime ?? playbackStateRef.current.time
+      frameId = window.requestAnimationFrame(tick)
+    }
+    tick()
+    return () => {
+      window.cancelAnimationFrame(frameId)
     }
   }, [isPlaying, runDetail?.source_url])
 
@@ -614,6 +713,7 @@ function App() {
     if (Math.abs(video.currentTime - target.start_s) > 0.35) {
       syncGuardRef.current = performance.now() + 280
       video.currentTime = target.start_s
+      playbackStateRef.current.time = target.start_s
     }
   }, [selectedTimestep, timeline])
 
@@ -625,6 +725,7 @@ function App() {
     if (!video) {
       return
     }
+    playbackStateRef.current.time = video.currentTime
     const nextIndex = findTimestepIndex(timeline, video.currentTime)
     if (nextIndex !== selectedTimestep) {
       startTransition(() => {
@@ -950,8 +1051,16 @@ function App() {
                         loop
                         className="review-video__player"
                         onTimeUpdate={handleVideoTimeUpdate}
-                        onPlay={() => setIsPlaying(true)}
-                        onPause={() => setIsPlaying(false)}
+                        onPlay={() => {
+                          playbackStateRef.current.isPlaying = true
+                          setIsPlaying(true)
+                        }}
+                        onPause={() => {
+                          playbackStateRef.current.isPlaying = false
+                          playbackStateRef.current.time =
+                            videoRef.current?.currentTime ?? playbackStateRef.current.time
+                          setIsPlaying(false)
+                        }}
                       />
                     ) : (
                       <div className="review-video__empty">Source video unavailable.</div>
@@ -987,12 +1096,22 @@ function App() {
                     <p className="panel__kicker">Interactive cortex</p>
                     <h2>3D cortical surface</h2>
                   </div>
-                  <p className="panel-note">Drag to orbit. Right-drag or shift-drag to pan. Scroll to zoom.</p>
+                  <p className="panel-note">
+                    Class mode: quantitative activation heatmap with optional atlas guides. Drag
+                    to orbit. Right-drag or shift-drag to pan. Scroll to zoom.
+                  </p>
                 </div>
                 <div className="brain-stage">
                   <div className="brain-stage__viewer">
                     <Suspense fallback={<div className="brain-stage__loading">Loading 3D renderer...</div>}>
-                      <ThreeBrainViewer mesh={mesh} frame={activeFrame} className="brain-stage__canvas" />
+                      <ThreeBrainViewer
+                        mesh={mesh}
+                        frames={brainFrames?.frames ?? []}
+                        selectedTimestep={selectedTimestep}
+                        playbackRef={playbackStateRef}
+                        overlayMode={brainOverlayMode}
+                        className="brain-stage__canvas"
+                      />
                     </Suspense>
                     <TimelineScroller
                       timeline={timeline}
@@ -1004,6 +1123,13 @@ function App() {
                     />
                   </div>
                   <div className="brain-stage__meta">
+                    <ActivationScaleCard displayMeta={runDetail.brain_display_meta} />
+                    <BrainOverlayCard
+                      overlayMode={brainOverlayMode}
+                      onOverlayChange={setBrainOverlayMode}
+                      mesh={mesh}
+                      displayMeta={runDetail.brain_display_meta}
+                    />
                     <div>
                       <span>Current timestep</span>
                       <strong>t{selectedTimestep}</strong>

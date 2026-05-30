@@ -702,6 +702,90 @@ input[type='range'] {
   padding: 14px;
 }
 
+.brain-display-card {
+  display: grid;
+  gap: 12px;
+}
+
+.brain-display-card__label {
+  display: block;
+  margin-bottom: 0;
+  color: #91a4ae;
+  font-size: 0.74rem;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.brain-display-card__note {
+  margin: 0;
+  color: #8ca2b9;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.brain-display-card__note code {
+  background: rgba(147, 197, 253, 0.08);
+  padding: 2px 6px;
+}
+
+.brain-scale {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.brain-scale__bar {
+  min-height: 188px;
+  border-radius: 999px;
+  border: 1px solid rgba(120, 144, 156, 0.4);
+  box-shadow: inset 0 0 18px rgba(0, 0, 0, 0.28);
+}
+
+.brain-scale__ticks {
+  display: grid;
+  align-content: space-between;
+  gap: 8px;
+}
+
+.brain-scale__ticks strong {
+  font-size: 0.9rem;
+}
+
+.brain-scale__ticks span {
+  color: #c7d3df;
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+
+.brain-overlay__control {
+  display: grid;
+  gap: 8px;
+  color: #dce8f3;
+  font-size: 0.92rem;
+}
+
+.brain-overlay__legend {
+  display: grid;
+  gap: 8px;
+}
+
+.brain-overlay__legend-item {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  color: #dce8f3;
+  font-size: 0.88rem;
+}
+
+.brain-overlay__swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
 .zone-summary {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }

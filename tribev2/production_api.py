@@ -303,6 +303,13 @@ def get_mesh_payload(mesh: str = "fsaverage5") -> dict[str, tp.Any]:
     zone_keys = list(ZONE_FAMILY_META.keys())
     zone_index_by_key = {zone_key: index for index, zone_key in enumerate(zone_keys)}
     vertex_zone_labels = get_hcp_vertex_labels(mesh=mesh, combine=False)
+    parcel_label_to_index: dict[str, int] = {}
+    parcel_indices: list[int] = []
+    for vertex_label in vertex_zone_labels:
+        label = vertex_label or "Unknown"
+        if label not in parcel_label_to_index:
+            parcel_label_to_index[label] = len(parcel_label_to_index)
+        parcel_indices.append(parcel_label_to_index[label])
     zone_indices = [
         zone_index_by_key.get(
             classify_roi_family(vertex_label) if vertex_label else "association_other",
@@ -322,6 +329,8 @@ def get_mesh_payload(mesh: str = "fsaverage5") -> dict[str, tp.Any]:
             for zone_key, zone_meta in ZONE_FAMILY_META.items()
         },
         "zone_indices": zone_indices,
+        "parcel_indices": parcel_indices,
+        "parcel_count": len(parcel_label_to_index),
     }
 
 
@@ -464,6 +473,13 @@ def build_run_detail_payload(cache_folder: Path, run_id: str, run: PredictionRun
         "preview_url": f"/api/runs/{run_id}/preview" if metadata.get("preview_file") else None,
         "brain_mesh_url": "/api/brain/mesh",
         "brain_frames_url": f"/api/runs/{run_id}/brain/frames",
+        "brain_display_meta": {
+            "mesh": "fsaverage5",
+            "activation_range": [0.0, 1.0],
+            "activation_units": "normalized activation",
+            "normalization": "shared_percentile_99_reference",
+            "overlay_note": "Optional overlays are categorical guides and do not change activation values.",
+        },
         "timeline": build_timeline_payload(run, run_id),
         "zone_series": build_zone_series_payload(run),
         "dominant_zones": frame_to_records(run_zone_frame.head(8)),
