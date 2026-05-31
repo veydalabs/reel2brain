@@ -34,12 +34,15 @@ from tribev2.easy import (
     DEFAULT_TEXT_MODEL,
     ImageComparisonRun,
     PredictionRun,
+    STAGGERED_SECOND_PASS_OFFSET_S,
     _smooth_surface_values,
     _get_surface_render_data,
     ZONE_FAMILY_META,
+    build_offset_events,
     build_display_reference_signal,
     build_emotion_hypothesis_frame,
     build_run_roi_frame,
+    build_staggered_prediction_run,
     build_run_zone_frame,
     build_timestep_report_frame,
     build_timestep_zone_frame,
@@ -470,6 +473,7 @@ def build_run_detail_payload(cache_folder: Path, run_id: str, run: PredictionRun
         "source_name": source_name,
         "source_url": source_url,
         "source_mime": source_mime,
+        "run_metadata": run.run_metadata,
         "preview_url": f"/api/runs/{run_id}/preview" if metadata.get("preview_file") else None,
         "brain_mesh_url": "/api/brain/mesh",
         "brain_frames_url": f"/api/runs/{run_id}/brain/frames",
@@ -498,6 +502,7 @@ def build_run_detail_payload(cache_folder: Path, run_id: str, run: PredictionRun
             "transcribe": False,
             "seconds_per_word": 0.45,
             "max_context_words": 128,
+            "staggered_sampling": False,
         },
     }
 
@@ -524,14 +529,35 @@ def run_prediction_job(cache_folder: Path, job_id: str) -> None:
             seconds_per_word=float(options["seconds_per_word"]),
             max_context_words=int(options["max_context_words"]),
         )
-        update_job(cache_folder, job_id, progress_pct=68, progress_label="Running TRIBE")
-        run = predict_from_prepared_events(
+        update_job(cache_folder, job_id, progress_pct=56, progress_label="Running TRIBE pass 1")
+        primary_run = predict_from_prepared_events(
             model,
             events,
             input_kind=input_kind,
             source_path=source_path,
             verbose=False,
         )
+        staggered_sampling = bool(options.get("staggered_sampling"))
+        if staggered_sampling:
+            update_job(cache_folder, job_id, progress_pct=74, progress_label="Running TRIBE pass 2")
+            staggered_events = build_offset_events(
+                events,
+                start_offset_s=STAGGERED_SECOND_PASS_OFFSET_S,
+            )
+            staggered_run = predict_from_prepared_events(
+                model,
+                staggered_events,
+                input_kind=input_kind,
+                source_path=source_path,
+                verbose=False,
+            )
+            run = build_staggered_prediction_run(
+                primary_run,
+                staggered_run,
+                start_offset_s=STAGGERED_SECOND_PASS_OFFSET_S,
+            )
+        else:
+            run = primary_run
         update_job(cache_folder, job_id, progress_pct=86, progress_label="Saving run")
         run_id = persist_saved_run(cache_folder, run)
         update_job(
@@ -654,6 +680,7 @@ def create_app() -> FastAPI:
         text_model_name: str = Form(DEFAULT_TEXT_MODEL),
         text_mode: str = Form("paper"),
         transcribe: str = Form("false"),
+        staggered_sampling: str = Form("false"),
         seconds_per_word: float = Form(0.45),
         max_context_words: int = Form(128),
     ) -> dict[str, tp.Any]:
@@ -674,6 +701,7 @@ def create_app() -> FastAPI:
             "text_mode": text_mode,
             "direct_text": text_mode == "direct",
             "transcribe": to_bool(transcribe),
+            "staggered_sampling": to_bool(staggered_sampling),
             "seconds_per_word": float(seconds_per_word),
             "max_context_words": int(max_context_words),
         }

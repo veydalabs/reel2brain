@@ -46,6 +46,7 @@ from tribev2.plotting.utils import (
     robust_normalize,
 )
 from tribev2.utils import get_hcp_labels, summarize_by_roi
+from neuralset.events.etypes import Event
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ PRIMARY_TEXT_MODEL = "meta-llama/Llama-3.2-3B"
 FALLBACK_TEXT_MODEL = "unsloth/Llama-3.2-3B"
 DEFAULT_TEXT_MODEL = PRIMARY_TEXT_MODEL
 VALID_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+STAGGERED_SECOND_PASS_OFFSET_S = 0.5
 
 
 @dataclass
@@ -63,6 +65,32 @@ class PredictionRun:
     input_kind: str
     source_path: Path | None = None
     raw_text: str | None = None
+    run_metadata: dict[str, tp.Any] = field(default_factory=dict)
+
+
+@dataclass
+class StoredSegment:
+    start: float
+    duration: float
+    timeline: str
+    ns_events: list[Event] = field(default_factory=list)
+
+    @property
+    def stop(self) -> float:
+        return self.start + self.duration
+
+    @property
+    def events(self) -> pd.DataFrame:
+        evts = [event.to_dict() for event in self.ns_events]
+        return pd.DataFrame(evts)
+
+    def copy(self, offset: float = 0.0, duration: float | None = None) -> "StoredSegment":
+        return StoredSegment(
+            start=self.start + offset,
+            duration=duration if duration is not None else self.duration,
+            timeline=self.timeline,
+            ns_events=self.ns_events,
+        )
 
 
 @dataclass
@@ -643,6 +671,137 @@ def predict_from_prepared_events(
         input_kind=input_kind,
         source_path=source_path,
         raw_text=raw_text,
+    )
+
+
+def build_offset_events(
+    events: pd.DataFrame,
+    *,
+    start_offset_s: float,
+) -> pd.DataFrame:
+    """Build a second-pass events frame trimmed by a fixed leading offset."""
+    if start_offset_s <= 0:
+        return events.copy()
+
+    shifted_rows: list[dict[str, tp.Any]] = []
+    records = events.to_dict(orient="records")
+    for row in records:
+        event_type = str(row.get("type", "") or "")
+        start = float(row.get("start", 0.0) or 0.0)
+        duration = float(row.get("duration", 0.0) or 0.0)
+        stop = start + duration
+        if stop <= start_offset_s + 1e-9:
+            continue
+
+        next_row = dict(row)
+        next_row.pop("stop", None)
+        clipped_prefix = max(start_offset_s - start, 0.0)
+        next_row["start"] = round(max(start - start_offset_s, 0.0), 6)
+        next_row["duration"] = round(max(stop - start_offset_s - next_row["start"], 0.0), 6)
+
+        if "offset" in next_row and not pd.isna(next_row["offset"]):
+            next_row["offset"] = round(float(next_row.get("offset", 0.0) or 0.0) + clipped_prefix, 6)
+
+        if next_row["duration"] <= 1e-6 and event_type not in {"Word", "Sentence", "Text"}:
+            continue
+        shifted_rows.append(next_row)
+
+    if not shifted_rows:
+        raise ValueError(
+            f"Offset pass requires more than {start_offset_s:.2f}s of usable stimulus."
+        )
+
+    shifted = pd.DataFrame(shifted_rows)
+    sort_columns = [column for column in ("start", "timeline", "type") if column in shifted.columns]
+    if sort_columns:
+        shifted = shifted.sort_values(sort_columns, kind="stable")
+    return shifted.reset_index(drop=True)
+
+
+def _clone_event_with_time_shift(event: Event, *, start_shift_s: float = 0.0) -> Event:
+    payload = event.to_dict()
+    payload["start"] = round(float(payload.get("start", 0.0) or 0.0) + start_shift_s, 6)
+    return Event.from_dict(payload)
+
+
+def materialize_segment(
+    segment: tp.Any,
+    *,
+    start_shift_s: float = 0.0,
+) -> StoredSegment:
+    try:
+        source_events = list(getattr(segment, "ns_events", []))
+    except Exception:
+        source_events = []
+    return StoredSegment(
+        start=round(float(getattr(segment, "start", 0.0) or 0.0) + start_shift_s, 6),
+        duration=round(float(getattr(segment, "duration", 0.0) or 0.0), 6),
+        timeline=str(getattr(segment, "timeline", "default") or "default"),
+        ns_events=[
+            _clone_event_with_time_shift(event, start_shift_s=start_shift_s)
+            for event in source_events
+        ],
+    )
+
+
+def build_staggered_prediction_run(
+    primary_run: PredictionRun,
+    staggered_run: PredictionRun,
+    *,
+    start_offset_s: float = STAGGERED_SECOND_PASS_OFFSET_S,
+) -> PredictionRun:
+    """Interleave a second offset TRIBE pass into one half-step playback run."""
+    interleaved: list[tuple[float, int, np.ndarray, StoredSegment]] = []
+    order = 0
+    for pred, segment in zip(primary_run.preds, primary_run.segments):
+        interleaved.append(
+            (
+                float(getattr(segment, "start", 0.0) or 0.0),
+                order,
+                np.asarray(pred, dtype=float),
+                materialize_segment(segment),
+            )
+        )
+        order += 2
+    for pred, segment in zip(staggered_run.preds, staggered_run.segments):
+        interleaved.append(
+            (
+                float(getattr(segment, "start", 0.0) or 0.0) + start_offset_s,
+                order - 1,
+                np.asarray(pred, dtype=float),
+                materialize_segment(segment, start_shift_s=start_offset_s),
+            )
+        )
+        order += 2
+
+    interleaved.sort(key=lambda item: (round(item[0], 6), item[1]))
+    if not interleaved:
+        raise ValueError("Cannot build a staggered run from empty prediction outputs.")
+
+    preds = np.stack([item[2] for item in interleaved], axis=0)
+    segments = [item[3] for item in interleaved]
+    run_metadata = dict(primary_run.run_metadata)
+    run_metadata.update(
+        {
+            "sampling_mode": "staggered_half_second",
+            "sampling_label": "Dual-pass 0.5s stagger",
+            "sampling_offset_s": float(start_offset_s),
+            "native_window_s": 1.0,
+            "effective_spacing_s": 0.5,
+            "sampling_note": (
+                "Interleaves a second TRIBE pass prepared with a 0.5s start offset. "
+                "This improves temporal sampling density but does not create native 2 fps predictions."
+            ),
+        }
+    )
+    return PredictionRun(
+        events=primary_run.events,
+        preds=preds,
+        segments=segments,
+        input_kind=primary_run.input_kind,
+        source_path=primary_run.source_path,
+        raw_text=primary_run.raw_text,
+        run_metadata=run_metadata,
     )
 
 

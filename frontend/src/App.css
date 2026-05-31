@@ -273,6 +273,14 @@ textarea,
   width: auto;
 }
 
+.form-note {
+  grid-column: 1 / -1;
+  margin: -4px 0 0;
+  color: #90a8b6;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
 .disclosure {
   border-top: 1px solid rgba(42, 55, 70, 0.88);
   padding-top: 14px;

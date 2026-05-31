@@ -141,6 +141,9 @@ def _extract_visual_preview_bytes(run: PredictionRun | ImageComparisonRun) -> by
 
 def _saved_run_card_text(run: PredictionRun | ImageComparisonRun) -> tuple[str, str]:
     kind_label = _format_run_input_kind(run)
+    mode_label = ""
+    if isinstance(run, PredictionRun):
+        mode_label = str(run.run_metadata.get("sampling_label", "") or "").strip()
     if isinstance(run, ImageComparisonRun):
         if run.compare_kind == "text":
             texts = [_truncate_saved_text(item.raw_text or "") for item in run.runs[:2]]
@@ -151,13 +154,25 @@ def _saved_run_card_text(run: PredictionRun | ImageComparisonRun) -> tuple[str, 
         return kind_label, kind_label
     if isinstance(run, MultiModalRun):
         if run.raw_text:
-            return kind_label, _truncate_saved_text(run.raw_text)
+            subtitle = _truncate_saved_text(run.raw_text)
+            if mode_label:
+                subtitle = f"{subtitle} · {mode_label}"
+            return kind_label, subtitle
         names = [path.name for _, path in sorted(run.source_paths.items())]
-        return kind_label, " · ".join(names) or kind_label
+        subtitle = " · ".join(names) or kind_label
+        if mode_label:
+            subtitle = f"{subtitle} · {mode_label}"
+        return kind_label, subtitle
     if run.input_kind == "text":
-        return kind_label, _truncate_saved_text(run.raw_text or "")
+        subtitle = _truncate_saved_text(run.raw_text or "")
+        if mode_label:
+            subtitle = f"{subtitle} · {mode_label}"
+        return kind_label, subtitle
     if run.source_path is not None:
-        return kind_label, run.source_path.name
+        subtitle = run.source_path.name
+        if mode_label:
+            subtitle = f"{subtitle} · {mode_label}"
+        return kind_label, subtitle
     return kind_label, kind_label
 
 
@@ -170,7 +185,10 @@ def get_run_cache_key(run: PredictionRun) -> str:
         f"{run.input_kind}:{run.preds.shape}:"
         f"{float(np.abs(run.preds).mean()):.6f}:{float(np.abs(run.preds).max()):.6f}"
     )
-    return f"{source_key}:{signal_key}"
+    metadata_key = ""
+    if run.run_metadata:
+        metadata_key = ":" + json.dumps(run.run_metadata, sort_keys=True, ensure_ascii=True)
+    return f"{source_key}:{signal_key}{metadata_key}"
 
 
 def get_saved_run_key(run: PredictionRun | ImageComparisonRun) -> str:
@@ -201,6 +219,7 @@ def _serialize_prediction_run(run: PredictionRun) -> dict[str, tp.Any]:
         "input_kind": run.input_kind,
         "source_path": str(run.source_path) if run.source_path is not None else None,
         "raw_text": run.raw_text,
+        "run_metadata": run.run_metadata,
     }
     if isinstance(run, MultiModalRun):
         payload["kind"] = "multimodal"
@@ -234,6 +253,7 @@ def _deserialize_prediction_run(payload: dict[str, tp.Any]) -> PredictionRun:
         "input_kind": str(payload["input_kind"]),
         "source_path": Path(source_path) if source_path else None,
         "raw_text": payload.get("raw_text"),
+        "run_metadata": tp.cast(dict[str, tp.Any], payload.get("run_metadata", {})),
     }
     if payload.get("kind") == "multimodal":
         return MultiModalRun(

@@ -25,6 +25,7 @@ const DEFAULT_UPLOAD_SETTINGS = {
   text_model_name: 'meta-llama/Llama-3.2-3B',
   text_mode: 'paper',
   transcribe: false,
+  staggered_sampling: false,
   seconds_per_word: 0.45,
   max_context_words: 128,
 }
@@ -915,23 +916,40 @@ function App() {
                       <option value="direct">Direct transcript timing</option>
                     </select>
                   </label>
-                  <label className="checkbox-row">
-                    <input
-                      type="checkbox"
-                      checked={uploadSettings.transcribe}
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={uploadSettings.transcribe}
                       onChange={(event) =>
                         setUploadSettings((current) => ({
                           ...current,
                           transcribe: event.target.checked,
                         }))
                       }
-                    />
-                    <span>Transcribe video audio</span>
-                  </label>
-                  <label>
-                    Seconds / word
-                    <input
-                      type="number"
+                  />
+                  <span>Transcribe video audio</span>
+                </label>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={uploadSettings.staggered_sampling}
+                    onChange={(event) =>
+                      setUploadSettings((current) => ({
+                        ...current,
+                        staggered_sampling: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Dual-pass 0.5s stagger (experimental)</span>
+                </label>
+                <p className="form-note">
+                  Runs TRIBE twice and interleaves a second pass offset by <code>0.5s</code>.
+                  Smoother temporal sampling, but not native higher-rate brain prediction.
+                </p>
+                <label>
+                  Seconds / word
+                  <input
+                    type="number"
                       step="0.05"
                       min="0.1"
                       max="1.0"
@@ -1015,6 +1033,12 @@ function App() {
                   <div>
                     <p className="panel__kicker">Run summary</p>
                     <h2>{runDetail.subtitle || runDetail.title}</h2>
+                    {runDetail.run_metadata?.sampling_label ? (
+                      <p className="panel-note">
+                        Mode: <strong>{runDetail.run_metadata.sampling_label}</strong>.{' '}
+                        {runDetail.run_metadata.sampling_note}
+                      </p>
+                    ) : null}
                   </div>
                 </div>
                 <div className="metric-strip">
