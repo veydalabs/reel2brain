@@ -145,6 +145,7 @@ function buildSignalMaterial({
   fresnelStrength,
   fresnelPower,
   floorStrength,
+  displacementScale = 0,
   motionAmount = 0,
   blending,
   polygonOffset = false,
@@ -157,6 +158,7 @@ function buildSignalMaterial({
       fresnelStrength: { value: fresnelStrength },
       fresnelPower: { value: fresnelPower },
       floorStrength: { value: floorStrength },
+      displacementScale: { value: displacementScale },
       time: { value: 0 },
       motionAmount: { value: motionAmount },
     },
@@ -170,13 +172,27 @@ function buildSignalMaterial({
       varying vec3 vViewPosition;
       varying vec3 vLocalPosition;
 
+      uniform float displacementScale;
+      uniform float time;
+      uniform float motionAmount;
+
       void main() {
-        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
         vSignalColor = signalColor;
         vSignalStrength = signalStrength;
+        float strength = clamp(signalStrength, 0.0, 1.0);
+        float motionWave =
+          sin(position.x * 4.8 + time * 1.6) * 0.28 +
+          sin(position.y * 5.6 - time * 1.3) * 0.22 +
+          sin(position.z * 4.2 + time * 1.1) * 0.16;
+        float displacement =
+          pow(strength, 1.45) *
+          displacementScale *
+          (1.0 + motionWave * motionAmount * 1.6);
+        vec3 displacedPosition = position + normal * displacement;
+        vec4 mvPosition = modelViewMatrix * vec4(displacedPosition, 1.0);
         vNormal = normalize(normalMatrix * normal);
         vViewPosition = -mvPosition.xyz;
-        vLocalPosition = position;
+        vLocalPosition = displacedPosition;
         gl_Position = projectionMatrix * mvPosition;
       }
     `,
@@ -229,6 +245,128 @@ function buildSignalMaterial({
     polygonOffset,
     polygonOffsetFactor: polygonOffset ? -2 : 0,
     polygonOffsetUnits: polygonOffset ? -4 : 0,
+  })
+}
+
+function buildParticleMaterial({
+  opacity,
+  intensity,
+  size,
+  lift,
+}) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      opacity: { value: opacity },
+      intensity: { value: intensity },
+      size: { value: size },
+      lift: { value: lift },
+      time: { value: 0 },
+    },
+    vertexShader: `
+      attribute vec3 signalColor;
+      attribute float signalStrength;
+
+      varying vec3 vSignalColor;
+      varying float vSignalStrength;
+
+      uniform float size;
+      uniform float lift;
+      uniform float time;
+
+      void main() {
+        float strength = clamp(signalStrength, 0.0, 1.0);
+        float pulse =
+          0.88 +
+          0.12 * sin(
+            time * 2.6 +
+            position.x * 3.4 +
+            position.y * 4.1 +
+            position.z * 2.7
+          );
+        vec3 displacedPosition = position + normal * lift * (0.55 + strength * 1.9);
+        vec4 mvPosition = modelViewMatrix * vec4(displacedPosition, 1.0);
+
+        vSignalColor = signalColor;
+        vSignalStrength = strength;
+
+        gl_PointSize =
+          max(0.0, (1.8 + pow(strength, 0.82) * size * pulse) * (260.0 / max(1.0, -mvPosition.z)));
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `,
+    fragmentShader: `
+      uniform float opacity;
+      uniform float intensity;
+
+      varying vec3 vSignalColor;
+      varying float vSignalStrength;
+
+      void main() {
+        vec2 centered = gl_PointCoord * 2.0 - 1.0;
+        float radius = dot(centered, centered);
+        if (radius > 1.0) {
+          discard;
+        }
+
+        float halo = smoothstep(1.0, 0.02, radius);
+        float core = smoothstep(0.22, 0.0, sqrt(radius));
+        float alpha = (halo * 0.48 + core * 0.92) * opacity * vSignalStrength;
+        vec3 color =
+          vSignalColor * (0.6 + vSignalStrength * intensity) +
+          vec3(core * vSignalStrength * 0.42);
+
+        if (alpha < 0.0025) {
+          discard;
+        }
+
+        gl_FragColor = vec4(color, alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
+  })
+}
+
+function buildFilamentMaterial({ opacity }) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      opacity: { value: opacity },
+    },
+    vertexShader: `
+      attribute vec3 color;
+      attribute float signalStrength;
+
+      varying vec3 vColor;
+      varying float vSignalStrength;
+
+      void main() {
+        vColor = color;
+        vSignalStrength = clamp(signalStrength, 0.0, 1.0);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float opacity;
+
+      varying vec3 vColor;
+      varying float vSignalStrength;
+
+      void main() {
+        float alpha = pow(vSignalStrength, 1.12) * opacity;
+        if (alpha < 0.0025) {
+          discard;
+        }
+        gl_FragColor = vec4(vColor * (0.45 + vSignalStrength * 1.35), alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
   })
 }
 
@@ -488,6 +626,155 @@ function clearSignalLayer(layer) {
   layer.strength.needsUpdate = true
 }
 
+function resetTrailState(trailState) {
+  if (!trailState) {
+    return
+  }
+  trailState.colors.fill(0)
+  trailState.strengths.fill(0)
+}
+
+function createTrailState(vertexCount) {
+  return {
+    colors: new Float32Array(vertexCount * 3),
+    strengths: new Float32Array(vertexCount),
+  }
+}
+
+function updateTrailState(trailState, sourceColors, sourceStrengths, deltaSeconds) {
+  if (!trailState) {
+    return
+  }
+
+  const decay = Math.exp(-deltaSeconds / 1.08)
+
+  for (let index = 0; index < sourceStrengths.length; index += 1) {
+    const nextStrength = sourceStrengths[index]
+    const decayedStrength = trailState.strengths[index] * decay
+    const colorOffset = index * 3
+
+    if (nextStrength >= decayedStrength) {
+      trailState.strengths[index] = nextStrength
+      trailState.colors[colorOffset] = sourceColors[colorOffset]
+      trailState.colors[colorOffset + 1] = sourceColors[colorOffset + 1]
+      trailState.colors[colorOffset + 2] = sourceColors[colorOffset + 2]
+    } else if (decayedStrength <= 0.0015) {
+      trailState.strengths[index] = 0
+      trailState.colors[colorOffset] = 0
+      trailState.colors[colorOffset + 1] = 0
+      trailState.colors[colorOffset + 2] = 0
+    } else {
+      trailState.strengths[index] = decayedStrength
+    }
+  }
+}
+
+function buildMeshEdgePairs(faces) {
+  const seenEdges = new Set()
+  const pairs = []
+  const edges = [
+    [0, 1],
+    [1, 2],
+    [2, 0],
+  ]
+
+  for (const face of faces) {
+    for (const [leftIndex, rightIndex] of edges) {
+      const leftVertex = face[leftIndex]
+      const rightVertex = face[rightIndex]
+      const edgeKey =
+        leftVertex < rightVertex
+          ? `${leftVertex}:${rightVertex}`
+          : `${rightVertex}:${leftVertex}`
+      if (seenEdges.has(edgeKey)) {
+        continue
+      }
+      seenEdges.add(edgeKey)
+      pairs.push(leftVertex, rightVertex)
+    }
+  }
+
+  return new Uint32Array(pairs)
+}
+
+function buildFilamentLayer(positions, normals, edgePairs, offset) {
+  const geometry = new THREE.BufferGeometry()
+  const linePositions = new Float32Array(edgePairs.length * 3)
+  const lineColors = new Float32Array(edgePairs.length * 3)
+  const lineStrengths = new Float32Array(edgePairs.length)
+
+  for (let index = 0; index < edgePairs.length; index += 1) {
+    const vertex = edgePairs[index]
+    const sourceOffset = vertex * 3
+    const targetOffset = index * 3
+    linePositions[targetOffset] = positions[sourceOffset] + normals[sourceOffset] * offset
+    linePositions[targetOffset + 1] = positions[sourceOffset + 1] + normals[sourceOffset + 1] * offset
+    linePositions[targetOffset + 2] = positions[sourceOffset + 2] + normals[sourceOffset + 2] * offset
+  }
+
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3))
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(lineColors, 3))
+  geometry.setAttribute('signalStrength', new THREE.Float32BufferAttribute(lineStrengths, 1))
+
+  const material = buildFilamentMaterial({ opacity: 0.48 })
+  const filaments = new THREE.LineSegments(geometry, material)
+  filaments.renderOrder = 7
+
+  return {
+    lines: filaments,
+    color: geometry.getAttribute('color'),
+    strength: geometry.getAttribute('signalStrength'),
+    edgePairs,
+  }
+}
+
+function updateFilamentLayer(layer, sourceColors, sourceStrengths) {
+  if (!layer) {
+    return
+  }
+
+  const { edgePairs } = layer
+  const colorArray = layer.color.array
+  const strengthArray = layer.strength.array
+
+  for (let index = 0; index < edgePairs.length; index += 2) {
+    const leftVertex = edgePairs[index]
+    const rightVertex = edgePairs[index + 1]
+    const leftStrength = sourceStrengths[leftVertex] ?? 0
+    const rightStrength = sourceStrengths[rightVertex] ?? 0
+    const coupled = Math.min(leftStrength, rightStrength)
+    const average = (leftStrength + rightStrength) * 0.5
+    const visibleStrength = smoothstep(0.18, 0.78, coupled) * Math.pow(average, 0.78)
+
+    const leftColorOffset = leftVertex * 3
+    const rightColorOffset = rightVertex * 3
+    const targetOffset = index * 3
+
+    strengthArray[index] = visibleStrength
+    strengthArray[index + 1] = visibleStrength
+
+    const red =
+      ((sourceColors[leftColorOffset] ?? 0) + (sourceColors[rightColorOffset] ?? 0)) * 0.5
+    const green =
+      ((sourceColors[leftColorOffset + 1] ?? 0) + (sourceColors[rightColorOffset + 1] ?? 0)) *
+      0.5
+    const blue =
+      ((sourceColors[leftColorOffset + 2] ?? 0) + (sourceColors[rightColorOffset + 2] ?? 0)) *
+      0.5
+    const intensity = 0.22 + visibleStrength * 1.18
+
+    for (let segmentIndex = 0; segmentIndex < 2; segmentIndex += 1) {
+      const colorOffset = targetOffset + segmentIndex * 3
+      colorArray[colorOffset] = clamp(red * intensity, 0, 1)
+      colorArray[colorOffset + 1] = clamp(green * intensity, 0, 1)
+      colorArray[colorOffset + 2] = clamp(blue * intensity, 0, 1)
+    }
+  }
+
+  layer.color.needsUpdate = true
+  layer.strength.needsUpdate = true
+}
+
 function buildBoundaryPayload({
   positions,
   normals,
@@ -587,14 +874,17 @@ export function ThreeBrainViewer({
   const controlsRef = useRef(null)
   const cameraRef = useRef(null)
   const viewStateRef = useRef(null)
+  const signalParticlesRef = useRef(null)
   const signalScatterRef = useRef(null)
   const signalSurfaceRef = useRef(null)
   const signalShellRef = useRef(null)
+  const signalFilamentsRef = useRef(null)
   const overlayRefs = useRef({ hcp: null, systems: null })
   const signalCacheRef = useRef(new Map())
   const framesRef = useRef(frames)
   const selectedTimestepRef = useRef(selectedTimestep)
   const blendedSignalRef = useRef(null)
+  const particleTrailRef = useRef(null)
 
   useEffect(() => {
     framesRef.current = frames
@@ -708,12 +998,13 @@ export function ThreeBrainViewer({
     signalScatterGeometry.setAttribute('signalColor', signalScatterColor)
     signalScatterGeometry.setAttribute('signalStrength', signalScatterStrength)
     const signalScatterMaterial = buildSignalMaterial({
-      opacity: 0.26,
+      opacity: 0.18,
       intensity: 0.62,
       fresnelStrength: 0.16,
       fresnelPower: 1.2,
       floorStrength: 0.0,
       motionAmount: 0.022,
+      displacementScale: radius * 0.008,
       blending: THREE.AdditiveBlending,
       side: THREE.BackSide,
     })
@@ -737,7 +1028,8 @@ export function ThreeBrainViewer({
       fresnelStrength: 0.18,
       fresnelPower: 2.8,
       floorStrength: 0.06,
-      motionAmount: 0,
+      motionAmount: 0.008,
+      displacementScale: radius * 0.014,
       blending: THREE.NormalBlending,
       polygonOffset: true,
     })
@@ -761,6 +1053,7 @@ export function ThreeBrainViewer({
       fresnelPower: 1.8,
       floorStrength: 0.02,
       motionAmount: 0.05,
+      displacementScale: radius * 0.024,
       blending: THREE.AdditiveBlending,
     })
     const signalShell = new THREE.Mesh(signalShellGeometry, signalShellMaterial)
@@ -771,6 +1064,44 @@ export function ThreeBrainViewer({
       color: signalShellColor,
       strength: signalShellStrength,
     }
+
+    const signalParticleGeometry = new THREE.BufferGeometry()
+    signalParticleGeometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(centeredPositions, 3),
+    )
+    signalParticleGeometry.setAttribute(
+      'normal',
+      new THREE.Float32BufferAttribute(centeredNormals, 3),
+    )
+    const signalParticleColor = new THREE.Float32BufferAttribute(new Float32Array(vertexCount * 3), 3)
+    const signalParticleStrength = new THREE.Float32BufferAttribute(new Float32Array(vertexCount), 1)
+    signalParticleGeometry.setAttribute('signalColor', signalParticleColor)
+    signalParticleGeometry.setAttribute('signalStrength', signalParticleStrength)
+    const signalParticleMaterial = buildParticleMaterial({
+      opacity: 0.68,
+      intensity: 1.2,
+      size: 20,
+      lift: radius * 0.026,
+    })
+    const signalParticles = new THREE.Points(signalParticleGeometry, signalParticleMaterial)
+    signalParticles.renderOrder = 6
+    scene.add(signalParticles)
+    signalParticlesRef.current = {
+      color: signalParticleColor,
+      strength: signalParticleStrength,
+    }
+    particleTrailRef.current = createTrailState(vertexCount)
+
+    const edgePairs = buildMeshEdgePairs(mesh.faces)
+    const filamentLayer = buildFilamentLayer(
+      centeredPositions,
+      centeredNormals,
+      edgePairs,
+      radius * 0.017,
+    )
+    scene.add(filamentLayer.lines)
+    signalFilamentsRef.current = filamentLayer
 
     const hcpBoundaryPayload = buildBoundaryPayload({
       positions: centeredPositions,
@@ -865,21 +1196,33 @@ export function ThreeBrainViewer({
     resize()
 
     let active = true
+    let previousFrameTime = performance.now() / 1000
     const renderLoop = () => {
       if (!active) {
         return
       }
       const nowSeconds = performance.now() / 1000
+      const deltaSeconds = clamp(nowSeconds - previousFrameTime, 1 / 240, 0.2)
+      previousFrameTime = nowSeconds
+      signalParticleMaterial.uniforms.time.value = nowSeconds
       signalScatterMaterial.uniforms.time.value = nowSeconds
       signalSurfaceMaterial.uniforms.time.value = nowSeconds
       signalShellMaterial.uniforms.time.value = nowSeconds
       signalScatterMaterial.uniforms.motionAmount.value =
         playbackRef?.current?.isPlaying ? 0.024 : 0.012
+      signalSurfaceMaterial.uniforms.motionAmount.value =
+        playbackRef?.current?.isPlaying ? 0.014 : 0.008
       signalShellMaterial.uniforms.motionAmount.value =
         playbackRef?.current?.isPlaying ? 0.052 : 0.028
 
       const activeFrames = framesRef.current ?? []
-      if (activeFrames.length && signalSurfaceRef.current && signalShellRef.current) {
+      if (
+        activeFrames.length &&
+        signalSurfaceRef.current &&
+        signalShellRef.current &&
+        signalParticlesRef.current &&
+        signalFilamentsRef.current
+      ) {
         const playbackState = playbackRef?.current ?? {
           time: activeFrames[selectedTimestepRef.current]?.start_s ?? 0,
           isPlaying: false,
@@ -903,6 +1246,7 @@ export function ThreeBrainViewer({
           )
 
           if (fromPayload && toPayload) {
+            let displayPayload = fromPayload
             if (
               blendState.fromIndex === blendState.toIndex ||
               blendState.blend <= 0.001
@@ -943,6 +1287,7 @@ export function ThreeBrainViewer({
                 blendState.blend,
                 blendedSignalRef.current,
               )
+              displayPayload = blendedPayload
               setSignalLayerAttributes(
                 signalScatterRef.current,
                 blendedPayload.scatterColors,
@@ -959,6 +1304,26 @@ export function ThreeBrainViewer({
                 blendedPayload.shellStrengths,
               )
             }
+
+            const particleTrail = particleTrailRef.current
+            updateTrailState(
+              particleTrail,
+              displayPayload.shellColors,
+              displayPayload.scatterStrengths,
+              deltaSeconds,
+            )
+            if (particleTrail) {
+              setSignalLayerAttributes(
+                signalParticlesRef.current,
+                particleTrail.colors,
+                particleTrail.strengths,
+              )
+            }
+            updateFilamentLayer(
+              signalFilamentsRef.current,
+              displayPayload.shellColors,
+              displayPayload.shellStrengths,
+            )
           }
         }
       }
@@ -977,11 +1342,15 @@ export function ThreeBrainViewer({
       signalScatterGeometry.dispose()
       signalSurfaceGeometry.dispose()
       signalShellGeometry.dispose()
+      signalParticleGeometry.dispose()
       anatomyMaterial.dispose()
       rimMaterial.dispose()
+      signalParticleMaterial.dispose()
       signalScatterMaterial.dispose()
       signalSurfaceMaterial.dispose()
       signalShellMaterial.dispose()
+      filamentLayer.lines.geometry.dispose()
+      filamentLayer.lines.material.dispose()
       hcpLines?.geometry.dispose()
       hcpLines?.material.dispose()
       systemsLines?.geometry.dispose()
@@ -1004,6 +1373,9 @@ export function ThreeBrainViewer({
       signalScatterRef.current = null
       signalSurfaceRef.current = null
       signalShellRef.current = null
+      signalParticlesRef.current = null
+      signalFilamentsRef.current = null
+      particleTrailRef.current = null
       overlayRefs.current = { hcp: null, systems: null }
       signalCache.clear()
     }
@@ -1011,11 +1383,15 @@ export function ThreeBrainViewer({
 
   useEffect(() => {
     if ((frames?.length ?? 0) > 0) {
+      resetTrailState(particleTrailRef.current)
       return
     }
+    clearSignalLayer(signalParticlesRef.current)
     clearSignalLayer(signalScatterRef.current)
     clearSignalLayer(signalSurfaceRef.current)
     clearSignalLayer(signalShellRef.current)
+    clearSignalLayer(signalFilamentsRef.current)
+    resetTrailState(particleTrailRef.current)
   }, [frames])
 
   useEffect(() => {
@@ -1086,6 +1462,11 @@ export function ThreeBrainViewer({
         >
           Reset
         </button>
+      </div>
+      <div className="brain-viewer__hud">
+        <span className="brain-viewer__hud-pill">Relief surface</span>
+        <span className="brain-viewer__hud-pill">Particle halo</span>
+        <span className="brain-viewer__hud-pill">Hot-edge filaments</span>
       </div>
       <div ref={hostRef} className="brain-viewer__canvas" />
     </div>

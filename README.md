@@ -27,7 +27,6 @@ source .venv/bin/activate
 pip install -e ".[plotting,webapp]"
 cd frontend
 npm install
-npm run build
 cd ..
 ```
 
@@ -39,6 +38,9 @@ reel2brain
 ```
 
 The app serves on `http://localhost:8000`.
+
+On launch, `reel2brain` checks whether the frontend source is newer than the bundled app in
+`tribev2/web_dist` and runs `npm run build` automatically when needed.
 
 ## Frontend Development
 
