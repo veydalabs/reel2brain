@@ -684,6 +684,12 @@ input[type='range'] {
   backdrop-filter: blur(10px);
 }
 
+.brain-viewer__button--active {
+  border-color: rgba(126, 241, 255, 0.62);
+  background: linear-gradient(180deg, rgba(12, 25, 34, 0.96), rgba(6, 14, 20, 0.9));
+  box-shadow: 0 0 0 1px rgba(126, 241, 255, 0.18), 0 12px 24px rgba(0, 0, 0, 0.24);
+}
+
 .brain-viewer__hud {
   position: absolute;
   right: 14px;
