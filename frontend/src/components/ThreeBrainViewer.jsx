@@ -1258,19 +1258,18 @@ export function ThreeBrainViewer({
 
     const anatomyMaterial = new THREE.MeshPhysicalMaterial({
       vertexColors: true,
-      roughness: 0.82,
+      roughness: 0.92,
       metalness: 0.02,
-      envMapIntensity: 0.22,
+      envMapIntensity: 0.12,
       transparent: true,
-      opacity: 0.24,
-      transmission: 0.72,
-      thickness: 0.16,
-      ior: 1.08,
-      attenuationDistance: 2.4,
-      attenuationColor: new THREE.Color('#96b7d6'),
-      clearcoat: 0.1,
-      clearcoatRoughness: 0.66,
-      depthWrite: false,
+      opacity: 0.9,
+      transmission: 0.18,
+      thickness: 0.42,
+      ior: 1.12,
+      attenuationDistance: 0.92,
+      attenuationColor: new THREE.Color('#8ea7c4'),
+      clearcoat: 0.03,
+      clearcoatRoughness: 0.8,
       side: THREE.DoubleSide,
     })
     const anatomySurface = new THREE.Mesh(geometry, anatomyMaterial)
@@ -1299,6 +1298,7 @@ export function ThreeBrainViewer({
     })
     const basePointCloud = new THREE.Points(basePointGeometry, basePointMaterial)
     basePointCloud.renderOrder = 1
+    basePointCloud.visible = false
     scene.add(basePointCloud)
 
     const interiorPointPositions = new Float32Array(centeredPositions.length)
@@ -1326,6 +1326,7 @@ export function ThreeBrainViewer({
     })
     const interiorPointCloud = new THREE.Points(interiorPointGeometry, interiorPointMaterial)
     interiorPointCloud.renderOrder = 1
+    interiorPointCloud.visible = false
     scene.add(interiorPointCloud)
 
     const signalScatterGeometry = geometry.clone()
@@ -1523,6 +1524,7 @@ export function ThreeBrainViewer({
       anatomyMaterial,
       rimShell,
       shadowPlane,
+      basePointCloud,
       basePointMaterial,
       interiorPointCloud,
       interiorPointMaterial,
@@ -1780,22 +1782,30 @@ export function ThreeBrainViewer({
     layers.signalShell.visible = true
     layers.signalParticles.visible = true
     layers.filaments.visible = true
-    layers.interiorPointCloud.visible = !plotted
+    layers.basePointCloud.visible = plotted
+    layers.interiorPointCloud.visible = plotted
 
     if (layers.shadowPlane) {
       layers.shadowPlane.visible = !plotted
     }
 
-    layers.basePointMaterial.uniforms.opacity.value = plotted ? 0.46 : 0.19
+    layers.basePointMaterial.uniforms.opacity.value = plotted ? 0.46 : 0
     layers.basePointMaterial.uniforms.size.value = plotted ? 3.2 : 2.1
-    layers.interiorPointMaterial.uniforms.opacity.value = plotted ? 0 : 0.22
-    layers.interiorPointMaterial.uniforms.size.value = plotted ? 2.6 : 3.1
+    layers.interiorPointMaterial.uniforms.opacity.value = plotted ? 0.22 : 0
+    layers.interiorPointMaterial.uniforms.size.value = plotted ? 3.1 : 2.6
 
-    layers.anatomyMaterial.opacity = plotted ? 0.24 : 0.18
-    layers.anatomyMaterial.transmission = plotted ? 0.72 : 0.84
-    layers.anatomyMaterial.thickness = plotted ? 0.16 : 0.1
-    layers.anatomyMaterial.envMapIntensity = plotted ? 0.22 : 0.28
-    layers.anatomyMaterial.attenuationDistance = plotted ? 2.4 : 3.2
+    layers.anatomyMaterial.roughness = plotted ? 0.82 : 0.92
+    layers.anatomyMaterial.envMapIntensity = plotted ? 0.22 : 0.12
+    layers.anatomyMaterial.opacity = plotted ? 0.24 : 0.9
+    layers.anatomyMaterial.transmission = plotted ? 0.72 : 0.18
+    layers.anatomyMaterial.thickness = plotted ? 0.16 : 0.42
+    layers.anatomyMaterial.ior = plotted ? 1.08 : 1.12
+    layers.anatomyMaterial.attenuationDistance = plotted ? 2.4 : 0.92
+    layers.anatomyMaterial.attenuationColor.set(plotted ? '#96b7d6' : '#8ea7c4')
+    layers.anatomyMaterial.clearcoat = plotted ? 0.1 : 0.03
+    layers.anatomyMaterial.clearcoatRoughness = plotted ? 0.66 : 0.8
+    layers.anatomyMaterial.depthWrite = !plotted
+    layers.anatomyMaterial.needsUpdate = true
   }, [renderMode])
 
   function applyViewPreset(preset) {
