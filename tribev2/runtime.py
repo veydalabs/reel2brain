@@ -22,6 +22,7 @@ _WARNING_FILTERS: tuple[tuple[str, type[Warning] | None], ...] = (
 
 _WARNING_LOGGER_INSTALLED = False
 _TQDM_DESTRUCTOR_PATCHED = False
+_MOVIEPY_FFMPEG_PARSER_PATCHED = False
 
 
 def apply_warning_filters() -> None:
@@ -32,6 +33,7 @@ def apply_warning_filters() -> None:
         warnings.filterwarnings("ignore", **kwargs)
     logging.getLogger("neuralset.extractors.base").setLevel(logging.ERROR)
     _install_tqdm_destructor_guard()
+    _install_moviepy_ffmpeg_parser_patch()
 
 
 def configure_file_logging(
@@ -122,3 +124,42 @@ def _install_tqdm_destructor_guard() -> None:
 
     tqdm_cls.__del__ = _safe_del
     _TQDM_DESTRUCTOR_PATCHED = True
+
+
+class _MoviePyMetadataFloat(float):
+    """Preserve numeric rotation values while allowing MoviePy metadata joins."""
+
+    def __add__(self, other):
+        if isinstance(other, str):
+            return f"{self}{other}"
+        return float(self) + other
+
+    def __radd__(self, other):
+        if isinstance(other, str):
+            return f"{other}{self}"
+        return other + float(self)
+
+
+def _install_moviepy_ffmpeg_parser_patch() -> None:
+    global _MOVIEPY_FFMPEG_PARSER_PATCHED
+    if _MOVIEPY_FFMPEG_PARSER_PATCHED:
+        return
+
+    try:
+        from moviepy.video.io.ffmpeg_reader import FFmpegInfosParser
+    except Exception:
+        return
+
+    original_cast = getattr(FFmpegInfosParser, "video_metadata_type_casting", None)
+    if original_cast is None:
+        _MOVIEPY_FFMPEG_PARSER_PATCHED = True
+        return
+
+    def _patched_video_metadata_type_casting(self, field, value):
+        field, value = original_cast(self, field, value)
+        if field in {"rotate", "displaymatrix"} and isinstance(value, float):
+            return field, _MoviePyMetadataFloat(value)
+        return field, value
+
+    FFmpegInfosParser.video_metadata_type_casting = _patched_video_metadata_type_casting
+    _MOVIEPY_FFMPEG_PARSER_PATCHED = True
